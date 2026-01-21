@@ -384,6 +384,7 @@ target_sources(app-lib PRIVATE
   commands/cmd_clear_cel.cpp
   commands/cmd_clear_recent_files.cpp
   commands/cmd_close_file.cpp
+  commands/cmd_online_session.cpp
   commands/cmd_color_quantization.cpp
   commands/cmd_contiguous_fill.cpp
   commands/cmd_copy.cpp
@@ -565,6 +566,8 @@ target_sources(app-lib PRIVATE
   modules.cpp
   modules/gfx.cpp
   modules/gui.cpp
+  online/online_protocol.cpp
+  online/online_session_manager.cpp
   modules/palettes.cpp
   pref/preferences.cpp
   recent_files.cpp
@@ -667,6 +670,7 @@ target_sources(app-lib PRIVATE
   ui/main_window.cpp
   ui/mini_help_button.cpp
   ui/notifications.cpp
+  ui/online_session_window.cpp
   ui/optional_alert.cpp
   ui/palette_popup.cpp
   ui/palette_view.cpp

@@ -18,3 +18,5 @@ build
 .build
 .deps
 CMakeSettings.json
+skia
+builds_dir

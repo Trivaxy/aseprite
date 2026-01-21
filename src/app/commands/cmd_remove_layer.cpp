@@ -16,6 +16,7 @@
 #include "app/doc_api.h"
 #include "app/i18n/strings.h"
 #include "app/modules/gui.h"
+#include "app/online/online_session_manager.h"
 #include "app/pref/preferences.h"
 #include "app/tx.h"
 #include "app/ui/optional_alert.h"
@@ -111,6 +112,12 @@ RemoveLayerCommand::RemoveLayerCommand() : Command(CommandId::RemoveLayer())
 
 bool RemoveLayerCommand::onEnabled(Context* context)
 {
+  if (context) {
+    auto* session = online::OnlineSessionManager::instance();
+    if (session->isActive() && session->document() == context->activeDocument()) {
+      return session->isHost() || session->localCanEditLayers();
+    }
+  }
   if (!context->checkFlags(ContextFlags::ActiveDocumentIsWritable | ContextFlags::HasActiveSprite |
                            ContextFlags::HasActiveLayer))
     return false;
@@ -132,6 +139,19 @@ void RemoveLayerCommand::onExecute(Context* context)
   ContextWriter writer(context);
   Doc* document(writer.document());
   Sprite* sprite(writer.sprite());
+
+  auto* session = online::OnlineSessionManager::instance();
+  if (session->isActive() && session->document() == document) {
+    const Site& site = writer.site();
+    if (site.inTimeline() && !site.selectedLayers().empty()) {
+      ui::Alert::show("Removing multiple layers is not supported in Online Sessions V1.");
+      return;
+    }
+    if (auto* layer = writer.layer())
+      session->requestRemoveLayer(context, layer);
+    return;
+  }
+
   {
     Tx tx(writer, "Remove Layer");
     DocApi api = document->getApi(tx);

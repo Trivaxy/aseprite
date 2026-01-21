@@ -724,6 +724,13 @@
         <menu text="@.file_import" group="file_import">
           <item command="ImportSpriteSheet" text="@.file_import_sprite_sheet" group="file_import_1" />
         </menu>
+        <separator />
+        <menu text="@.file_online_session" id="online_session_menu">
+          <item command="HostOnlineSession" text="@.file_online_session_host" />
+          <item command="JoinOnlineSession" text="@.file_online_session_join" />
+          <item command="OnlineSession" text="@.file_online_session_session" />
+          <item command="LeaveOnlineSession" text="@.file_online_session_leave" />
+        </menu>
         <separator id="scripts_menu_separator" />
         <menu id="scripts_menu" text="@.file_scripts" group="file_scripts">
           <item command="OpenScriptFolder" text="@.file_open_script_folder" />

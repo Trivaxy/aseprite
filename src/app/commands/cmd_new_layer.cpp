@@ -23,6 +23,7 @@
 #include "app/doc_api.h"
 #include "app/i18n/strings.h"
 #include "app/modules/gui.h"
+#include "app/online/online_session_manager.h"
 #include "app/pref/preferences.h"
 #include "app/restore_visible_layers.h"
 #include "app/tx.h"
@@ -123,6 +124,12 @@ void NewLayerCommand::onLoadParams(const Params& commandParams)
 
 bool NewLayerCommand::onEnabled(Context* ctx)
 {
+  if (ctx) {
+    auto* session = online::OnlineSessionManager::instance();
+    if (session->isActive() && session->document() == ctx->activeDocument()) {
+      return session->isHost() || session->localCanEditLayers();
+    }
+  }
   if (!ctx->checkFlags(ContextFlags::ActiveDocumentIsWritable | ContextFlags::HasActiveSprite))
     return false;
 
@@ -153,6 +160,22 @@ void NewLayerCommand::onExecute(Context* context)
   Doc* document(reader.document());
   Sprite* sprite(reader.sprite());
   std::string name;
+
+  auto* session = online::OnlineSessionManager::instance();
+  if (session->isActive() && session->document() == document) {
+    if (params().ask() || params().fromFile() || params().fromClipboard() || params().viaCut() ||
+        params().viaCopy() || params().group() || params().reference() || params().tilemap()) {
+      ui::Alert::show("This New Layer mode is not supported in Online Sessions V1.");
+      return;
+    }
+
+    if (params().name.isSet())
+      name = params().name();
+
+    doc::Layer* afterLayer = site.layer();
+    session->requestNewLayer(context, afterLayer, name);
+    return;
+  }
 
   // Show the tooltip feedback only if we are not inside a transaction
   // (e.g. we can be already in a transaction if we are running in a

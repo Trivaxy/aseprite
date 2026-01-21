@@ -12,7 +12,9 @@
 #include "app/commands/command.h"
 #include "app/context_access.h"
 #include "app/modules/gui.h"
+#include "app/online/online_session_manager.h"
 #include "doc/layer.h"
+#include "ui/alert.h"
 
 namespace app {
 
@@ -34,6 +36,12 @@ LayerLockCommand::LayerLockCommand() : Command(CommandId::LayerLock())
 
 bool LayerLockCommand::onEnabled(Context* context)
 {
+  if (context) {
+    auto* session = online::OnlineSessionManager::instance();
+    if (session->isActive() && session->document() == context->activeDocument()) {
+      return session->isHost() || session->localCanLockLayers();
+    }
+  }
   return context->checkFlags(ContextFlags::ActiveDocumentIsWritable | ContextFlags::HasActiveLayer);
 }
 
@@ -63,6 +71,21 @@ void LayerLockCommand::onExecute(Context* context)
 {
   ContextWriter writer(context);
   Doc* doc = writer.document();
+
+  auto* session = online::OnlineSessionManager::instance();
+  if (session->isActive() && session->document() == doc) {
+    auto range = context->range();
+    if (range.enabled()) {
+      ui::Alert::show("Locking multiple layers is not supported in Online Sessions V1.");
+      return;
+    }
+    if (auto* layer = writer.layer()) {
+      const bool newLocked = layer->isEditable(); // editable -> lock, locked -> unlock
+      session->requestLayerLock(context, layer, newLocked);
+    }
+    return;
+  }
+
   SelectedLayers selLayers;
   auto range = context->range();
   if (range.enabled()) {

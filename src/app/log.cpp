@@ -14,6 +14,7 @@
 #include "app/app.h"
 #include "app/resource_finder.h"
 #include "base/log.h"
+#include "base/process.h"
 #include "fmt/format.h"
 #include "ver/info.h"
 
@@ -24,8 +25,9 @@ LoggerModule::LoggerModule(bool createLogInDesktop)
   app::ResourceFinder rf(false);
 
   if (createLogInDesktop) {
+    const auto pid = base::get_current_process_id();
     rf.includeDesktopDir(
-      fmt::format("{}-v{}-DebugOutput.txt", get_app_name(), get_app_version()).c_str());
+      fmt::format("{}-v{}-DebugOutput-{}.txt", get_app_name(), get_app_version(), pid).c_str());
   }
   else {
     rf.includeUserDir(fmt::format("{}.log", get_app_name()).c_str());

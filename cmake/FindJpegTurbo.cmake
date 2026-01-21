@@ -9,9 +9,12 @@
 
 if(LAF_BACKEND STREQUAL "skia")
 
+  get_filename_component(SKIA_DIR_ABS "${SKIA_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+  get_filename_component(SKIA_LIBRARY_DIR_ABS "${SKIA_LIBRARY_DIR}" ABSOLUTE BASE_DIR "${CMAKE_SOURCE_DIR}")
+
   find_library(LIBJPEG_TURBO_LIBRARY NAMES libjpeg jpeg
-    HINTS "${SKIA_LIBRARY_DIR}" NO_DEFAULT_PATH)
-  set(LIBJPEG_TURBO_INCLUDE_DIRS "${SKIA_DIR}/third_party/externals/libjpeg-turbo")
+    HINTS "${SKIA_LIBRARY_DIR_ABS}" NO_DEFAULT_PATH)
+  set(LIBJPEG_TURBO_INCLUDE_DIRS "${SKIA_DIR_ABS}/third_party/externals/libjpeg-turbo")
 
   add_library(libjpeg-turbo STATIC IMPORTED)
   set_target_properties(libjpeg-turbo PROPERTIES

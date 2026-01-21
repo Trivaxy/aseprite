@@ -66,6 +66,7 @@ class Doc : public doc::Document,
     kInhibitBackup = 4,    // Inhibit the backup process
     kFullyBackedUp = 8,    // Full backup was done
     kReadOnly = 16,        // This document is read-only
+    kOnlineSessionReadOnly = 32, // Read-only enforced by online session permissions
   };
 
 public:
@@ -182,6 +183,9 @@ public:
   void markAsReadOnly();
   bool isReadOnly() const;
   void removeReadOnlyMark();
+  void setOnlineSessionReadOnly(const bool readOnly) { m_flags = (readOnly ? (m_flags | kOnlineSessionReadOnly) :
+                                                                              (m_flags & ~kOnlineSessionReadOnly)); }
+  bool isOnlineSessionReadOnly() const { return (m_flags & kOnlineSessionReadOnly ? true : false); }
 
   //////////////////////////////////////////////////////////////////////
   // Loaded options from file

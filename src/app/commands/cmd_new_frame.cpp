@@ -16,12 +16,14 @@
 #include "app/doc_api.h"
 #include "app/i18n/strings.h"
 #include "app/modules/gui.h"
+#include "app/online/online_session_manager.h"
 #include "app/tx.h"
 #include "app/ui/main_window.h"
 #include "app/ui/status_bar.h"
 #include "app/ui/timeline/timeline.h"
 #include "doc/layer.h"
 #include "doc/sprite.h"
+#include "ui/alert.h"
 
 namespace app {
 
@@ -70,12 +72,33 @@ void NewFrameCommand::onLoadParams(const Params& params)
 
 bool NewFrameCommand::onEnabled(Context* context)
 {
+  if (context) {
+    auto* session = online::OnlineSessionManager::instance();
+    if (session->isActive() && session->document() == context->activeDocument()) {
+      return session->isHost() || session->localCanEditTimeline();
+    }
+  }
   return context->checkFlags(ContextFlags::ActiveDocumentIsWritable |
                              ContextFlags::HasActiveSprite);
 }
 
 void NewFrameCommand::onExecute(Context* context)
 {
+  auto* session = online::OnlineSessionManager::instance();
+  if (session->isActive() && session->document() == context->activeDocument()) {
+    std::string content;
+    switch (m_content) {
+      case Content::DUPLICATE_FRAME: content = "frame"; break;
+      case Content::NEW_EMPTY_FRAME: content = "empty"; break;
+      default: {
+        ui::Alert::show("This New Frame mode is not supported in Online Sessions V1.");
+        return;
+      }
+    }
+    session->requestNewFrame(context, content, context->activeSite().frame() + 1);
+    return;
+  }
+
   ContextWriter writer(context);
   Doc* document(writer.document());
   Sprite* sprite(writer.sprite());

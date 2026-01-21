@@ -12,6 +12,7 @@
 #include "app/tools/tool_loop_manager.h"
 
 #include "app/context.h"
+#include "app/online/online_session_manager.h"
 #include "app/snap_to_grid.h"
 #include "app/tools/controller.h"
 #include "app/tools/ink.h"
@@ -20,6 +21,7 @@
 #include "app/tools/symmetry.h"
 #include "app/tools/tool_loop.h"
 #include "app/tools/velocity.h"
+#include "base/log.h"
 #include "doc/brush.h"
 #include "doc/image.h"
 #include "doc/primitives.h"
@@ -66,14 +68,79 @@ void ToolLoopManager::end()
 {
   if (m_canceled)
     m_toolLoop->rollback();
-  else
+  else {
+    auto* session = online::OnlineSessionManager::instance();
+    const bool logOnlineStroke = (session && session->isActive() &&
+                                 session->document() == m_toolLoop->getDocument());
+
+    gfx::Region onlineStrokeRgn;
+    if (m_toolLoop->getInk() && m_toolLoop->getInk()->isPaint()) {
+      // Some paint interactions (e.g. a click/tap without movement)
+      // can end with an empty accumulated dirty area, so fall back to
+      // the last stroke point modified area.
+      onlineStrokeRgn = m_onlineSessionDirtyArea;
+      if (onlineStrokeRgn.isEmpty()) {
+        gfx::Rect rc;
+        Stroke::Pt pt;
+        if (!m_stroke.empty())
+          pt = m_stroke.lastPoint();
+        else
+          pt = getSpriteStrokePt(m_lastPointer);
+
+        m_toolLoop->getPointShape()->getModifiedArea(m_toolLoop, pt.x, pt.y, pt.symmetry, rc);
+        if (!rc.isEmpty())
+          onlineStrokeRgn = gfx::Region(rc);
+
+        if (logOnlineStroke) {
+          const gfx::Rect dirtyBounds = m_onlineSessionDirtyArea.bounds();
+          LOG(VERBOSE,
+              "ONLINE: end(): empty onlineDirty=(%d,%d %dx%d) strokePts=%d inkEraser=%d lastPt=(%d,%d) "
+              "fallbackRc=(%d,%d %dx%d)\n",
+              dirtyBounds.x,
+              dirtyBounds.y,
+              dirtyBounds.w,
+              dirtyBounds.h,
+              m_stroke.size(),
+              (m_toolLoop->getInk() ? int(m_toolLoop->getInk()->isEraser()) : 0),
+              pt.x,
+              pt.y,
+              rc.x,
+              rc.y,
+              rc.w,
+              rc.h);
+        }
+      }
+      else if (logOnlineStroke) {
+        const gfx::Rect dirtyBounds = m_onlineSessionDirtyArea.bounds();
+        LOG(VERBOSE,
+            "ONLINE: end(): onlineDirty=(%d,%d %dx%d) strokePts=%d inkEraser=%d\n",
+            dirtyBounds.x,
+            dirtyBounds.y,
+            dirtyBounds.w,
+            dirtyBounds.h,
+            m_stroke.size(),
+            (m_toolLoop->getInk() ? int(m_toolLoop->getInk()->isEraser()) : 0));
+      }
+    }
     m_toolLoop->commit();
+
+    if (!onlineStrokeRgn.isEmpty()) {
+      online::OnlineSessionManager::instance()->onPaintStrokeCommitted(m_toolLoop, onlineStrokeRgn);
+    }
+    else if (logOnlineStroke && m_toolLoop->getInk() && m_toolLoop->getInk()->isPaint()) {
+      LOG(VERBOSE,
+          "ONLINE: end(): skipping send (empty region) strokePts=%d inkEraser=%d\n",
+          m_stroke.size(),
+          int(m_toolLoop->getInk()->isEraser()));
+    }
+  }
 }
 
 void ToolLoopManager::prepareLoop(const Pointer& pointer)
 {
   // Start with no points at all
   m_stroke.reset();
+  m_onlineSessionDirtyArea.clear();
 
   // Prepare the ink
   m_toolLoop->getInk()->prepareInk(m_toolLoop);
@@ -364,6 +431,10 @@ void ToolLoopManager::calculateDirtyArea(const Strokes& strokes)
     m_toolLoop->getTiledModeHelper().wrapPosition(m_dirtyArea);
     m_toolLoop->getTiledModeHelper().collapseRegionByTiledMode(m_dirtyArea);
   }
+
+  // Keep an accumulated dirty-area for online session updates (we
+  // still use m_dirtyArea as the per-step region for performance).
+  m_onlineSessionDirtyArea |= m_dirtyArea;
 }
 
 Stroke::Pt ToolLoopManager::getSpriteStrokePt(const Pointer& pointer)

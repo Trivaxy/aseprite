@@ -99,6 +99,7 @@ private:
   Stroke m_stroke;
   Pointer m_lastPointer;
   gfx::Region m_dirtyArea;
+  gfx::Region m_onlineSessionDirtyArea;
   gfx::Region m_nextDirtyArea;
   DynamicsOptions m_dynamics;
   gfx::PointF m_stabilizerCenter;

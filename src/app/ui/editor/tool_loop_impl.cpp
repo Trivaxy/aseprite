@@ -24,6 +24,7 @@
 #include "app/i18n/strings.h"
 #include "app/modules/gui.h"
 #include "app/modules/palettes.h"
+#include "app/online/online_session_manager.h"
 #include "app/pref/preferences.h"
 #include "app/tools/controller.h"
 #include "app/tools/freehand_algorithm.h"
@@ -892,6 +893,16 @@ tools::ToolLoop* create_tool_loop(Editor* editor,
 
   if (!params.tool || !params.ink)
     return nullptr;
+
+  if (auto* session = online::OnlineSessionManager::instance();
+      session->isActive() && session->document() == site.document()) {
+    const bool editsDoc = (params.ink->isPaint() || params.ink->isSelection() || params.ink->isSlice() ||
+                           params.ink->isText());
+    if (editsDoc && !session->localCanEditCanvas()) {
+      StatusBar::instance()->showTip(2000, "Viewer: editing disabled by host.");
+      return nullptr;
+    }
+  }
 
   if (selectTiles) {
     params.tool = App::instance()->toolBox()->getToolById(

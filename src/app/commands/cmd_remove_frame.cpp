@@ -14,6 +14,7 @@
 #include "app/context_access.h"
 #include "app/doc_api.h"
 #include "app/modules/gui.h"
+#include "app/online/online_session_manager.h"
 #include "app/tx.h"
 #include "doc/sprite.h"
 
@@ -34,6 +35,12 @@ RemoveFrameCommand::RemoveFrameCommand() : Command(CommandId::RemoveFrame())
 
 bool RemoveFrameCommand::onEnabled(Context* context)
 {
+  if (context) {
+    auto* session = online::OnlineSessionManager::instance();
+    if (session->isActive() && session->document() == context->activeDocument()) {
+      return session->isHost() || session->localCanEditTimeline();
+    }
+  }
   if (!context->checkFlags(ContextFlags::ActiveDocumentIsWritable | ContextFlags::HasActiveSprite))
     return false;
 
@@ -44,6 +51,12 @@ bool RemoveFrameCommand::onEnabled(Context* context)
 
 void RemoveFrameCommand::onExecute(Context* context)
 {
+  auto* session = online::OnlineSessionManager::instance();
+  if (session->isActive() && session->document() == context->activeDocument()) {
+    session->requestRemoveFrame(context, context->activeSite().frame());
+    return;
+  }
+
   ContextWriter writer(context);
   Doc* document(writer.document());
   Sprite* sprite(writer.sprite());

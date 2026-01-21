@@ -418,7 +418,7 @@ void Doc::markAsReadOnly()
 
 bool Doc::isReadOnly() const
 {
-  return (m_flags & kReadOnly ? true : false);
+  return (m_flags & (kReadOnly | kOnlineSessionReadOnly) ? true : false);
 }
 
 void Doc::removeReadOnlyMark()

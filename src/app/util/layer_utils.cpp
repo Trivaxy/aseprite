@@ -8,6 +8,7 @@
 
 #include "app/doc.h"
 #include "app/i18n/strings.h"
+#include "app/online/online_session_manager.h"
 #include "app/ui/editor/editor.h"
 #include "app/ui/status_bar.h"
 #include "doc/layer.h"
@@ -35,6 +36,10 @@ bool layer_is_locked(Editor* editor)
   }
 
   if (!layer->isEditableHierarchy()) {
+    auto* session = online::OnlineSessionManager::instance();
+    if (session->isActive() && session->isHost() && session->document() == editor->document())
+      return false;
+
     if (statusBar) {
       statusBar->showTip(1000, Strings::statusbar_tips_layer_locked(layer->name()));
     }

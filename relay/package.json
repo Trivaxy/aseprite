@@ -1,0 +1,14 @@
+{
+    "name": "aseprite-relay",
+    "version": "1.0.0",
+    "description": "PartyKit relay server for Aseprite online sessions",
+    "main": "src/server.ts",
+    "scripts": {
+        "dev": "partykit dev",
+        "deploy": "partykit deploy"
+    },
+    "devDependencies": {
+        "partykit": "^0.0.115",
+        "typescript": "^5.0.0"
+    }
+}

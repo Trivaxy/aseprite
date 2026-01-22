@@ -20,3 +20,4 @@ build
 CMakeSettings.json
 skia
 builds_dir
+relay/node_modules

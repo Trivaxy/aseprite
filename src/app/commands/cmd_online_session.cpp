@@ -54,6 +54,70 @@ void open_session_window()
   }
 }
 
+// Show initial choice dialog for hosting
+// Returns: 0 = cancelled, 1 = PartyKit, 2 = Manual
+int showHostConnectionTypeDialog()
+{
+  ui::Window win(ui::Window::WithTitleBar, "Host Online Session");
+  auto* root = new ui::VBox;
+  win.addChild(root);
+
+  auto* label = new ui::Label("How would you like to create your session?");
+  root->addChild(label);
+
+  auto* buttons = new ui::HBox;
+  root->addChild(buttons);
+
+  int result = 0;
+  auto* partyBtn = new ui::Button("On the house");
+  auto* manualBtn = new ui::Button("Manually");
+  auto* cancelBtn = new ui::Button("Cancel");
+
+  partyBtn->Click.connect([&] { result = 1; win.closeWindow(partyBtn); });
+  manualBtn->Click.connect([&] { result = 2; win.closeWindow(manualBtn); });
+  cancelBtn->Click.connect([&] { result = 0; win.closeWindow(cancelBtn); });
+
+  buttons->addChild(partyBtn);
+  buttons->addChild(manualBtn);
+  buttons->addChild(cancelBtn);
+
+  win.centerWindow();
+  win.openWindowInForeground();
+  return result;
+}
+
+// Show initial choice dialog for joining
+// Returns: 0 = cancelled, 1 = PartyKit (room name), 2 = Manual (address)
+int showJoinConnectionTypeDialog()
+{
+  ui::Window win(ui::Window::WithTitleBar, "Join Online Session");
+  auto* root = new ui::VBox;
+  win.addChild(root);
+
+  auto* label = new ui::Label("How would you like to join?");
+  root->addChild(label);
+
+  auto* buttons = new ui::HBox;
+  root->addChild(buttons);
+
+  int result = 0;
+  auto* roomBtn = new ui::Button("Room name");
+  auto* addrBtn = new ui::Button("Address");
+  auto* cancelBtn = new ui::Button("Cancel");
+
+  roomBtn->Click.connect([&] { result = 1; win.closeWindow(roomBtn); });
+  addrBtn->Click.connect([&] { result = 2; win.closeWindow(addrBtn); });
+  cancelBtn->Click.connect([&] { result = 0; win.closeWindow(cancelBtn); });
+
+  buttons->addChild(roomBtn);
+  buttons->addChild(addrBtn);
+  buttons->addChild(cancelBtn);
+
+  win.centerWindow();
+  win.openWindowInForeground();
+  return result;
+}
+
 } // namespace
 
 class HostOnlineSessionCommand : public Command {
@@ -69,56 +133,109 @@ protected:
 
   void onExecute(Context* context) override
   {
-    ui::Window win(ui::Window::WithTitleBar, "Host Online Session");
-    auto* root = new ui::VBox;
-    win.addChild(root);
-
-    auto* addrRow = new ui::HBox;
-    root->addChild(addrRow);
-    addrRow->addChild(new ui::Label("Bind:"));
-    auto* addr = new ui::Entry(256, "127.0.0.1");
-    addr->setExpansive(true);
-    addrRow->addChild(addr);
-
-    auto* portRow = new ui::HBox;
-    root->addChild(portRow);
-    portRow->addChild(new ui::Label("Port:"));
-    auto* port = new ui::Entry(16, "5000");
-    port->setExpansive(true);
-    portRow->addChild(port);
-
-    auto* userRow = new ui::HBox;
-    root->addChild(userRow);
-    userRow->addChild(new ui::Label("Username:"));
-    auto* user = new ui::Entry(256, "Host");
-    user->setExpansive(true);
-    userRow->addChild(user);
-
-    auto* passRow = new ui::HBox;
-    root->addChild(passRow);
-    passRow->addChild(new ui::Label("Password:"));
-    auto* pass = new ui::Entry(256, "");
-    pass->setExpansive(true);
-    passRow->addChild(pass);
-
-    auto* buttons = new ui::HBox;
-    root->addChild(buttons);
-    auto* ok = new ui::Button("OK");
-    auto* cancel = new ui::Button("Cancel");
-    ok->Click.connect([&] { win.closeWindow(ok); });
-    cancel->Click.connect([&] { win.closeWindow(cancel); });
-    buttons->addChild(ok);
-    buttons->addChild(cancel);
-
-    win.centerWindow();
-    win.openWindowInForeground();
-    if (win.closer() != ok)
+    const int choice = showHostConnectionTypeDialog();
+    if (choice == 0)
       return;
 
-    const int p = parse_port(port->text(), 5000);
-    auto* doc = context->activeDocument();
-    app::online::OnlineSessionManager::instance()->startHost(context, doc, p, user->text(), pass->text(), addr->text());
-    open_session_window();
+    if (choice == 1) {
+      // PartyKit hosting
+      ui::Window win(ui::Window::WithTitleBar, "Host via PartyKit");
+      auto* root = new ui::VBox;
+      win.addChild(root);
+
+      auto* roomRow = new ui::HBox;
+      root->addChild(roomRow);
+      roomRow->addChild(new ui::Label("Room name:"));
+      auto* room = new ui::Entry(256, "");
+      room->setExpansive(true);
+      roomRow->addChild(room);
+
+      auto* userRow = new ui::HBox;
+      root->addChild(userRow);
+      userRow->addChild(new ui::Label("Username:"));
+      auto* user = new ui::Entry(256, "Host");
+      user->setExpansive(true);
+      userRow->addChild(user);
+
+      auto* passRow = new ui::HBox;
+      root->addChild(passRow);
+      passRow->addChild(new ui::Label("Password:"));
+      auto* pass = new ui::Entry(256, "");
+      pass->setExpansive(true);
+      passRow->addChild(pass);
+
+      auto* buttons = new ui::HBox;
+      root->addChild(buttons);
+      auto* ok = new ui::Button("OK");
+      auto* cancel = new ui::Button("Cancel");
+      ok->Click.connect([&] { win.closeWindow(ok); });
+      cancel->Click.connect([&] { win.closeWindow(cancel); });
+      buttons->addChild(ok);
+      buttons->addChild(cancel);
+
+      win.centerWindow();
+      win.openWindowInForeground();
+      if (win.closer() != ok)
+        return;
+
+      auto* doc = context->activeDocument();
+      app::online::OnlineSessionManager::instance()->startHostPartyKit(
+        context, doc, room->text(), user->text(), pass->text());
+      open_session_window();
+    }
+    else {
+      // Manual hosting (existing flow)
+      ui::Window win(ui::Window::WithTitleBar, "Host Manually");
+      auto* root = new ui::VBox;
+      win.addChild(root);
+
+      auto* addrRow = new ui::HBox;
+      root->addChild(addrRow);
+      addrRow->addChild(new ui::Label("Bind:"));
+      auto* addr = new ui::Entry(256, "127.0.0.1");
+      addr->setExpansive(true);
+      addrRow->addChild(addr);
+
+      auto* portRow = new ui::HBox;
+      root->addChild(portRow);
+      portRow->addChild(new ui::Label("Port:"));
+      auto* port = new ui::Entry(16, "5000");
+      port->setExpansive(true);
+      portRow->addChild(port);
+
+      auto* userRow = new ui::HBox;
+      root->addChild(userRow);
+      userRow->addChild(new ui::Label("Username:"));
+      auto* user = new ui::Entry(256, "Host");
+      user->setExpansive(true);
+      userRow->addChild(user);
+
+      auto* passRow = new ui::HBox;
+      root->addChild(passRow);
+      passRow->addChild(new ui::Label("Password:"));
+      auto* pass = new ui::Entry(256, "");
+      pass->setExpansive(true);
+      passRow->addChild(pass);
+
+      auto* buttons = new ui::HBox;
+      root->addChild(buttons);
+      auto* ok = new ui::Button("OK");
+      auto* cancel = new ui::Button("Cancel");
+      ok->Click.connect([&] { win.closeWindow(ok); });
+      cancel->Click.connect([&] { win.closeWindow(cancel); });
+      buttons->addChild(ok);
+      buttons->addChild(cancel);
+
+      win.centerWindow();
+      win.openWindowInForeground();
+      if (win.closer() != ok)
+        return;
+
+      const int p = parse_port(port->text(), 5000);
+      auto* doc = context->activeDocument();
+      app::online::OnlineSessionManager::instance()->startHost(context, doc, p, user->text(), pass->text(), addr->text());
+      open_session_window();
+    }
   }
 };
 
@@ -131,55 +248,107 @@ protected:
 
   void onExecute(Context* context) override
   {
-    ui::Window win(ui::Window::WithTitleBar, "Join Online Session");
-    auto* root = new ui::VBox;
-    win.addChild(root);
-
-    auto* addrRow = new ui::HBox;
-    root->addChild(addrRow);
-    addrRow->addChild(new ui::Label("Address:"));
-    auto* addr = new ui::Entry(256, "127.0.0.1");
-    addr->setExpansive(true);
-    addrRow->addChild(addr);
-
-    auto* portRow = new ui::HBox;
-    root->addChild(portRow);
-    portRow->addChild(new ui::Label("Port:"));
-    auto* port = new ui::Entry(16, "5000");
-    port->setExpansive(true);
-    portRow->addChild(port);
-
-    auto* userRow = new ui::HBox;
-    root->addChild(userRow);
-    userRow->addChild(new ui::Label("Username:"));
-    auto* user = new ui::Entry(256, "Guest");
-    user->setExpansive(true);
-    userRow->addChild(user);
-
-    auto* passRow = new ui::HBox;
-    root->addChild(passRow);
-    passRow->addChild(new ui::Label("Password:"));
-    auto* pass = new ui::Entry(256, "");
-    pass->setExpansive(true);
-    passRow->addChild(pass);
-
-    auto* buttons = new ui::HBox;
-    root->addChild(buttons);
-    auto* ok = new ui::Button("OK");
-    auto* cancel = new ui::Button("Cancel");
-    ok->Click.connect([&] { win.closeWindow(ok); });
-    cancel->Click.connect([&] { win.closeWindow(cancel); });
-    buttons->addChild(ok);
-    buttons->addChild(cancel);
-
-    win.centerWindow();
-    win.openWindowInForeground();
-    if (win.closer() != ok)
+    const int choice = showJoinConnectionTypeDialog();
+    if (choice == 0)
       return;
 
-    const int p = parse_port(port->text(), 5000);
-    app::online::OnlineSessionManager::instance()->join(context, addr->text(), p, user->text(), pass->text());
-    open_session_window();
+    if (choice == 1) {
+      // PartyKit join via room name
+      ui::Window win(ui::Window::WithTitleBar, "Join via Room Name");
+      auto* root = new ui::VBox;
+      win.addChild(root);
+
+      auto* roomRow = new ui::HBox;
+      root->addChild(roomRow);
+      roomRow->addChild(new ui::Label("Room name:"));
+      auto* room = new ui::Entry(256, "");
+      room->setExpansive(true);
+      roomRow->addChild(room);
+
+      auto* userRow = new ui::HBox;
+      root->addChild(userRow);
+      userRow->addChild(new ui::Label("Username:"));
+      auto* user = new ui::Entry(256, "Guest");
+      user->setExpansive(true);
+      userRow->addChild(user);
+
+      auto* passRow = new ui::HBox;
+      root->addChild(passRow);
+      passRow->addChild(new ui::Label("Password:"));
+      auto* pass = new ui::Entry(256, "");
+      pass->setExpansive(true);
+      passRow->addChild(pass);
+
+      auto* buttons = new ui::HBox;
+      root->addChild(buttons);
+      auto* ok = new ui::Button("OK");
+      auto* cancel = new ui::Button("Cancel");
+      ok->Click.connect([&] { win.closeWindow(ok); });
+      cancel->Click.connect([&] { win.closeWindow(cancel); });
+      buttons->addChild(ok);
+      buttons->addChild(cancel);
+
+      win.centerWindow();
+      win.openWindowInForeground();
+      if (win.closer() != ok)
+        return;
+
+      app::online::OnlineSessionManager::instance()->joinPartyKit(
+        context, room->text(), user->text(), pass->text());
+      open_session_window();
+    }
+    else {
+      // Manual join via address (existing flow)
+      ui::Window win(ui::Window::WithTitleBar, "Join via Address");
+      auto* root = new ui::VBox;
+      win.addChild(root);
+
+      auto* addrRow = new ui::HBox;
+      root->addChild(addrRow);
+      addrRow->addChild(new ui::Label("Address:"));
+      auto* addr = new ui::Entry(256, "127.0.0.1");
+      addr->setExpansive(true);
+      addrRow->addChild(addr);
+
+      auto* portRow = new ui::HBox;
+      root->addChild(portRow);
+      portRow->addChild(new ui::Label("Port:"));
+      auto* port = new ui::Entry(16, "5000");
+      port->setExpansive(true);
+      portRow->addChild(port);
+
+      auto* userRow = new ui::HBox;
+      root->addChild(userRow);
+      userRow->addChild(new ui::Label("Username:"));
+      auto* user = new ui::Entry(256, "Guest");
+      user->setExpansive(true);
+      userRow->addChild(user);
+
+      auto* passRow = new ui::HBox;
+      root->addChild(passRow);
+      passRow->addChild(new ui::Label("Password:"));
+      auto* pass = new ui::Entry(256, "");
+      pass->setExpansive(true);
+      passRow->addChild(pass);
+
+      auto* buttons = new ui::HBox;
+      root->addChild(buttons);
+      auto* ok = new ui::Button("OK");
+      auto* cancel = new ui::Button("Cancel");
+      ok->Click.connect([&] { win.closeWindow(ok); });
+      cancel->Click.connect([&] { win.closeWindow(cancel); });
+      buttons->addChild(ok);
+      buttons->addChild(cancel);
+
+      win.centerWindow();
+      win.openWindowInForeground();
+      if (win.closer() != ok)
+        return;
+
+      const int p = parse_port(port->text(), 5000);
+      app::online::OnlineSessionManager::instance()->join(context, addr->text(), p, user->text(), pass->text());
+      open_session_window();
+    }
   }
 };
 

@@ -67,8 +67,14 @@ public:
   bool localCanLockLayers() const;
   bool localCanEditTimeline() const;
 
+  // Direct connection methods (existing)
   bool startHost(Context* ctx, Doc* doc, int port, const std::string& username, const std::string& password, const std::string& bindAddress = "127.0.0.1");
   bool join(Context* ctx, const std::string& address, int port, const std::string& username, const std::string& password);
+
+  // PartyKit relay methods
+  bool startHostPartyKit(Context* ctx, Doc* doc, const std::string& roomName, const std::string& username, const std::string& password);
+  bool joinPartyKit(Context* ctx, const std::string& roomName, const std::string& username, const std::string& password);
+
   void leave();
 
   void attachWindow(OnlineSessionWindow* window);
@@ -100,6 +106,7 @@ private:
   void stopNoLock();
 
   enum class Role { None, Host, Guest };
+  enum class ConnectionType { None, Direct, PartyKit };
 
   struct PendingSnapshot {
     bool inProgress = false;
@@ -137,7 +144,9 @@ private:
   mutable std::recursive_mutex m_mutex;
 
   Role m_role = Role::None;
+  ConnectionType m_connType = ConnectionType::None;
   Doc* m_doc = nullptr;
+  std::string m_roomName; // For PartyKit sessions
 
   uint32_t m_localPeerId = 0;
   Permissions m_localPerms = 0;

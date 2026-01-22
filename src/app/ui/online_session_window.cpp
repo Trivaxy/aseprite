@@ -42,17 +42,9 @@ OnlineSessionWindow::OnlineSessionWindow() : ui::Window(ui::Window::WithTitleBar
   root->setExpansive(true);
   addChild(root);
 
-  auto* top = new HBox;
-  top->setExpansive(true);
-  root->addChild(top);
-
   m_status = new Label("Not connected.");
   m_status->setExpansive(true);
-  top->addChild(m_status);
-
-  m_leave = new Button("Leave");
-  m_leave->Click.connect([this] { onLeave(); });
-  top->addChild(m_leave);
+  root->addChild(m_status);
 
   auto* mid = new HBox;
   mid->setExpansive(true);
@@ -83,6 +75,7 @@ OnlineSessionWindow::OnlineSessionWindow() : ui::Window(ui::Window::WithTitleBar
   m_canLockLayers = new CheckBox("Lock Layers");
   m_canEditTimeline = new CheckBox("Timeline");
   m_kick = new Button("Kick");
+  m_leave = new Button("Leave");
 
   auto onPermToggle = [this] { applySelectedPermsToHost(); };
   m_canEditCanvas->Click.connect(onPermToggle);
@@ -90,12 +83,17 @@ OnlineSessionWindow::OnlineSessionWindow() : ui::Window(ui::Window::WithTitleBar
   m_canLockLayers->Click.connect(onPermToggle);
   m_canEditTimeline->Click.connect(onPermToggle);
   m_kick->Click.connect([this] { onKick(); });
+  m_leave->Click.connect([this] { onLeave(); });
 
   perms->addChild(m_canEditCanvas);
   perms->addChild(m_canEditLayers);
   perms->addChild(m_canLockLayers);
   perms->addChild(m_canEditTimeline);
-  perms->addChild(m_kick);
+
+  auto* actionButtons = new HBox;
+  actionButtons->addChild(m_kick);
+  actionButtons->addChild(m_leave);
+  perms->addChild(actionButtons);
 
   auto* chatBox = new VBox;
   chatBox->setExpansive(true);
@@ -162,10 +160,10 @@ void OnlineSessionWindow::refresh()
     m_status->setText("Not connected.");
   }
   else if (host) {
-    m_status->setText("Hosting (LAN/localhost-only).");
+    m_status->setText("Hosting session.");
   }
   else {
-    m_status->setText("Connected (viewer by default).");
+    m_status->setText("Connected as guest.");
   }
 
   m_leave->setEnabled(active);

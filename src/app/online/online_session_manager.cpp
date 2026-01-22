@@ -343,7 +343,9 @@ void OnlineSessionManager::stopNoLock()
   m_client.reset();
 
   m_role = Role::None;
+  m_connType = ConnectionType::None;
   m_doc = nullptr;
+  m_roomName.clear();
   m_localPeerId = 0;
   m_localPerms = 0;
   m_peers.clear();
@@ -1177,6 +1179,572 @@ void OnlineSessionManager::leave()
   updateWindow();
 }
 
+// PartyKit relay host URL (configurable via environment or build option)
+static constexpr const char* kPartyKitHost = "aseprite-relay.trivaxy.partykit.dev";
+
+bool OnlineSessionManager::startHostPartyKit(Context* ctx, Doc* doc, const std::string& roomName, const std::string& username, const std::string& password)
+{
+  if (!ctx || !doc) {
+    ui::Alert::show("No active document to host.");
+    return false;
+  }
+
+  if (roomName.empty()) {
+    ui::Alert::show("Room name cannot be empty.");
+    return false;
+  }
+
+  std::lock_guard lock(m_mutex);
+  stopNoLock();
+
+  auto host = std::make_unique<NetHost>();
+  host->snapshotBytes = buildSnapshotBytes(doc);
+  if (host->snapshotBytes.empty()) {
+    ui::Alert::show("Failed to build snapshot.");
+    stopNoLock();
+    return false;
+  }
+
+  host->password = password;
+
+  m_role = Role::Host;
+  m_connType = ConnectionType::PartyKit;
+  m_doc = doc;
+  m_roomName = roomName;
+  m_localPeerId = 1;
+  m_localPerms = (kPermEditCanvas | kPermEditLayers | kPermLockLayers | kPermEditTimeline);
+  m_peers.clear();
+  m_peers[m_localPeerId] = Peer{ m_localPeerId, m_localPerms, username.empty() ? "Host" : username };
+
+  // For PartyKit hosting, we connect as a client to the relay
+  // The relay will treat this connection as the "host" because of the ?host=true query param
+  auto client = std::make_unique<NetClient>();
+  client->ws = std::make_unique<ix::WebSocket>();
+  client->ws->disablePerMessageDeflate();
+  client->ws->disableAutomaticReconnection();
+  client->url = fmt::format("wss://{}/party/main/{}?host=true", kPartyKitHost, roomName);
+  LOG(INFO, "PARTYKIT HOST: Connecting to URL: %s\n", client->url.c_str());
+  client->ws->setUrl(client->url);
+  client->username = username;
+  client->password = password;
+
+  m_host = std::move(host);
+
+  // Track whether we've received the relay's OK response
+  auto relayConfirmed = std::make_shared<bool>(false);
+
+  client->ws->setOnMessageCallback([this, ctx, relayConfirmed](const ix::WebSocketMessagePtr& msg) {
+    if (!msg)
+      return;
+
+    if (msg->type == ix::WebSocketMessageType::Open) {
+      LOG(INFO, "PARTYKIT HOST: WebSocket connection opened\n");
+      ui::execute_from_ui_thread([this] {
+        std::lock_guard lock(m_mutex);
+        appendChatLine("Connected to PartyKit relay...");
+        updateWindow();
+      });
+      return;
+    }
+
+    if (msg->type == ix::WebSocketMessageType::Error) {
+      const std::string reason = msg->errorInfo.reason;
+      ui::execute_from_ui_thread([this, reason] {
+        std::lock_guard lock(m_mutex);
+        appendChatLine(fmt::format("Connection error: {}", reason));
+        updateWindow();
+      });
+      return;
+    }
+
+    if (msg->type == ix::WebSocketMessageType::Close) {
+      ui::execute_from_ui_thread([this] {
+        std::lock_guard lock(m_mutex);
+        appendChatLine("Connection closed.");
+        updateWindow();
+      });
+      return;
+    }
+
+    if (msg->type != ix::WebSocketMessageType::Message)
+      return;
+
+    LOG(INFO, "PARTYKIT HOST: Received message, binary=%d, size=%zu\n", msg->binary ? 1 : 0, msg->str.size());
+    if (!msg->binary) {
+      LOG(INFO, "PARTYKIT HOST: Text message: %s\n", msg->str.c_str());
+    }
+
+    // Check for relay JSON responses first (before relay is confirmed)
+    if (!*relayConfirmed && !msg->binary) {
+      const std::string& text = msg->str;
+      // Simple JSON parsing for relay responses
+      if (text.find("\"type\":\"host_ok\"") != std::string::npos ||
+          text.find("\"type\": \"host_ok\"") != std::string::npos) {
+        *relayConfirmed = true;
+        LOG(INFO, "PARTYKIT HOST: Relay confirmed host_ok\n");
+        ui::execute_from_ui_thread([this] {
+          std::lock_guard lock(m_mutex);
+          appendChatLine(fmt::format("Hosting room '{}'", m_roomName));
+          updateWindow();
+        });
+        return;
+      }
+      if (text.find("\"type\":\"error\"") != std::string::npos ||
+          text.find("\"type\": \"error\"") != std::string::npos) {
+        // Extract error message
+        std::string errMsg = "Room already exists";
+        auto msgPos = text.find("\"message\"");
+        if (msgPos != std::string::npos) {
+          auto colonPos = text.find(':', msgPos);
+          auto quoteStart = text.find('"', colonPos);
+          auto quoteEnd = text.find('"', quoteStart + 1);
+          if (quoteStart != std::string::npos && quoteEnd != std::string::npos) {
+            errMsg = text.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
+          }
+        }
+        ui::execute_from_ui_thread([this, errMsg] {
+          std::lock_guard lock(m_mutex);
+          ui::Alert::show(fmt::format("PartyKit Error<<{}", errMsg));
+          stopNoLock();
+          updateWindow();
+        });
+        return;
+      }
+    }
+
+    // After relay is confirmed, handle binary messages from guests
+    if (!msg->binary)
+      return;
+
+    // Handle guest messages (similar to direct host logic)
+    Reader r(msg->str);
+    uint8_t type8 = 0;
+    if (!r.readU8(type8))
+      return;
+    const auto type = MsgType(type8);
+    LOG(INFO, "PARTYKIT HOST: Received binary message type=%u\n", unsigned(type8));
+
+    if (type == MsgType::Hello) {
+      std::string user, pass;
+      if (!r.readString(user) || !r.readString(pass))
+        return;
+
+      ui::execute_from_ui_thread([this, user, pass] {
+        std::lock_guard lock(m_mutex);
+        if (!m_host || !m_client) return;
+        LOG(INFO, "PARTYKIT HOST: Received Hello from user='%s'\n", user.c_str());
+
+        // Validate Password
+        if (!m_host->password.empty() && m_host->password != pass) {
+          Writer w;
+          w.writeU8(uint8_t(MsgType::Error));
+          w.writeString("Invalid password");
+          m_client->ws->sendBinary(toString(w.data));
+          return;
+        }
+
+        // Validate Username
+        for (const auto& [id, p] : m_peers) {
+          if (p.name == user) {
+            Writer w;
+            w.writeU8(uint8_t(MsgType::Error));
+            w.writeString("Username taken");
+            m_client->ws->sendBinary(toString(w.data));
+            return;
+          }
+        }
+
+        // Assign peer ID and add to peers
+        uint32_t peerId = m_host->nextPeerId++;
+        m_peers[peerId] = Peer{ peerId, 0, user };
+
+        // Send Welcome
+        Writer w;
+        w.writeU8(uint8_t(MsgType::Welcome));
+        w.writeU32(peerId);
+        w.writeU32(0);
+        m_client->ws->sendBinary(toString(w.data));
+
+        // Send snapshot
+        std::vector<uint8_t> snapshot = m_host->snapshotBytes;
+        Writer wb;
+        wb.writeU8(uint8_t(MsgType::SnapshotBegin));
+        wb.writeU32(uint32_t(snapshot.size()));
+        m_client->ws->sendBinary(toString(wb.data));
+
+        static constexpr size_t kChunkSize = 128 * 1024;
+        size_t offset = 0;
+        while (offset < snapshot.size()) {
+          const size_t remaining = snapshot.size() - offset;
+          const size_t n = (remaining < kChunkSize ? remaining : kChunkSize);
+          std::vector<uint8_t> chunk(snapshot.begin() + offset, snapshot.begin() + offset + n);
+          Writer wd;
+          wd.writeU8(uint8_t(MsgType::SnapshotData));
+          wd.writeBytes(chunk);
+          m_client->ws->sendBinary(toString(wd.data));
+          offset += n;
+        }
+
+        Writer we;
+        we.writeU8(uint8_t(MsgType::SnapshotEnd));
+        m_client->ws->sendBinary(toString(we.data));
+
+        appendChatLine(fmt::format("{} connected.", user));
+        updateWindow();
+      });
+    }
+    // TODO: Handle other message types from guests via PartyKit relay
+  });
+
+  client->ws->start();
+  m_client = std::move(client);
+
+  appendChatLine(fmt::format("Connecting to room '{}'...", roomName));
+  updateWindow();
+  return true;
+}
+
+bool OnlineSessionManager::joinPartyKit(Context* ctx, const std::string& roomName, const std::string& username, const std::string& password)
+{
+  if (!ctx) {
+    ui::Alert::show("No context.");
+    return false;
+  }
+
+  if (roomName.empty()) {
+    ui::Alert::show("Room name cannot be empty.");
+    return false;
+  }
+
+  std::lock_guard lock(m_mutex);
+  stopNoLock();
+
+  m_role = Role::Guest;
+  m_connType = ConnectionType::PartyKit;
+  m_roomName = roomName;
+  m_doc = nullptr;
+  m_localPeerId = 0;
+  m_localPerms = 0;
+  m_peers.clear();
+
+  auto client = std::make_unique<NetClient>();
+  client->ws = std::make_unique<ix::WebSocket>();
+  client->ws->disablePerMessageDeflate();
+  client->ws->disableAutomaticReconnection();
+  client->url = fmt::format("wss://{}/party/main/{}", kPartyKitHost, roomName);
+  LOG(INFO, "PARTYKIT GUEST: Connecting to URL: %s\n", client->url.c_str());
+  client->ws->setUrl(client->url);
+
+  client->username = username;
+  client->password = password;
+
+  // Track whether we've received the relay's OK response
+  auto relayConfirmed = std::make_shared<bool>(false);
+
+  client->ws->setOnMessageCallback([this, ctx, relayConfirmed](const ix::WebSocketMessagePtr& msg) {
+    if (!msg)
+      return;
+
+    if (msg->type == ix::WebSocketMessageType::Open) {
+      LOG(INFO, "PARTYKIT GUEST: WebSocket connection opened\n");
+      ui::execute_from_ui_thread([this] {
+        std::lock_guard lock(m_mutex);
+        appendChatLine("Connected to PartyKit relay...");
+        updateWindow();
+      });
+      return;
+    }
+
+    if (msg->type == ix::WebSocketMessageType::Error) {
+      const std::string reason = msg->errorInfo.reason;
+      ui::execute_from_ui_thread([this, reason] {
+        std::lock_guard lock(m_mutex);
+        appendChatLine(fmt::format("Connection error: {}", reason));
+        updateWindow();
+      });
+      return;
+    }
+
+    if (msg->type == ix::WebSocketMessageType::Close) {
+      ui::execute_from_ui_thread([this] {
+        std::lock_guard lock(m_mutex);
+        appendChatLine("Connection closed.");
+        updateWindow();
+      });
+      return;
+    }
+
+    if (msg->type != ix::WebSocketMessageType::Message)
+      return;
+
+    LOG(INFO, "PARTYKIT GUEST: Received message, binary=%d, size=%zu\n", msg->binary ? 1 : 0, msg->str.size());
+    if (!msg->binary) {
+      LOG(INFO, "PARTYKIT GUEST: Text message: %s\n", msg->str.c_str());
+    }
+
+    // Check for relay JSON responses first (before relay is confirmed)
+    if (!*relayConfirmed && !msg->binary) {
+      const std::string& text = msg->str;
+      // Simple JSON parsing for relay responses
+      if (text.find("\"type\":\"guest_ok\"") != std::string::npos ||
+          text.find("\"type\": \"guest_ok\"") != std::string::npos) {
+        *relayConfirmed = true;
+        LOG(INFO, "PARTYKIT GUEST: Relay confirmed guest_ok, sending Hello\n");
+        ui::execute_from_ui_thread([this] {
+          std::lock_guard lock(m_mutex);
+          if (!m_client) return;
+
+          appendChatLine("Room found. Sending credentials...");
+          updateWindow();
+
+          // Send Hello to host (via relay)
+          Writer w;
+          w.writeU8(uint8_t(MsgType::Hello));
+          w.writeString(m_client->username);
+          w.writeString(m_client->password);
+          LOG(INFO, "PARTYKIT GUEST: Sending Hello with username='%s'\n", m_client->username.c_str());
+          m_client->ws->sendBinary(toString(w.data));
+        });
+        return;
+      }
+      if (text.find("\"type\":\"error\"") != std::string::npos ||
+          text.find("\"type\": \"error\"") != std::string::npos) {
+        // Extract error message
+        std::string errMsg = "Room not found";
+        auto msgPos = text.find("\"message\"");
+        if (msgPos != std::string::npos) {
+          auto colonPos = text.find(':', msgPos);
+          auto quoteStart = text.find('"', colonPos);
+          auto quoteEnd = text.find('"', quoteStart + 1);
+          if (quoteStart != std::string::npos && quoteEnd != std::string::npos) {
+            errMsg = text.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
+          }
+        }
+        ui::execute_from_ui_thread([this, errMsg] {
+          std::lock_guard lock(m_mutex);
+          ui::Alert::show(fmt::format("PartyKit Error<<{}", errMsg));
+          stopNoLock();
+          updateWindow();
+        });
+        return;
+      }
+      if (text.find("\"type\":\"host_disconnected\"") != std::string::npos ||
+          text.find("\"type\": \"host_disconnected\"") != std::string::npos) {
+        ui::execute_from_ui_thread([this] {
+          std::lock_guard lock(m_mutex);
+          ui::Alert::show("Host disconnected");
+          stopNoLock();
+          updateWindow();
+        });
+        return;
+      }
+    }
+
+    // After relay is confirmed, handle binary messages from host
+    if (!msg->binary)
+      return;
+
+    Reader r(msg->str);
+    uint8_t type8 = 0;
+    if (!r.readU8(type8))
+      return;
+
+    const auto type = MsgType(type8);
+    switch (type) {
+      case MsgType::Error: {
+        std::string text;
+        if (r.readString(text)) {
+          ui::execute_from_ui_thread([text] {
+            ui::Alert::show(fmt::format("Connection Error<<{}", text));
+          });
+        }
+        break;
+      }
+      case MsgType::Welcome: {
+        uint32_t peerId = 0;
+        uint32_t perms = 0;
+        if (!r.readU32(peerId) || !r.readU32(perms))
+          return;
+        ui::execute_from_ui_thread([this, peerId, perms] { onWelcome(peerId, perms); });
+        break;
+      }
+      case MsgType::SnapshotBegin: {
+        uint32_t sizeBytes = 0;
+        if (!r.readU32(sizeBytes))
+          return;
+        ui::execute_from_ui_thread([this, sizeBytes] { onSnapshotBegin(sizeBytes); });
+        break;
+      }
+      case MsgType::SnapshotData: {
+        std::vector<uint8_t> chunk;
+        if (!r.readBytes(chunk))
+          return;
+        ui::execute_from_ui_thread([this, chunk = std::move(chunk)] { onSnapshotData(chunk); });
+        break;
+      }
+      case MsgType::SnapshotEnd: {
+        ui::execute_from_ui_thread([this, ctx] { onSnapshotEnd(ctx); });
+        break;
+      }
+      case MsgType::PermissionsSet: {
+        uint32_t peerId = 0;
+        uint32_t perms = 0;
+        if (!r.readU32(peerId) || !r.readU32(perms))
+          return;
+        ui::execute_from_ui_thread([this, peerId, perms] { onPermissionsSet(peerId, perms); });
+        break;
+      }
+      case MsgType::Kick: {
+        std::string reason;
+        r.readString(reason);
+        ui::execute_from_ui_thread([this, reason] { onKick(reason); });
+        break;
+      }
+      case MsgType::ChatBroadcast: {
+        uint32_t peerId = 0;
+        std::string text;
+        if (!r.readU32(peerId) || !r.readString(text))
+          return;
+        ui::execute_from_ui_thread([this, peerId, text] { onChatBroadcast(peerId, text); });
+        break;
+      }
+      case MsgType::Op: {
+        uint64_t rev = 0;
+        uint32_t authorPeerId = 0;
+        uint8_t opType8 = 0;
+        if (!r.readU64(rev) || !r.readU32(authorPeerId) || !r.readU8(opType8))
+          return;
+        const auto opType = OpType(opType8);
+        const std::vector<uint8_t> payload(r.p, r.end);
+        LOG(INFO, "PARTYKIT GUEST: Received Op rev=%u author=%u type=%u payload=%u\n",
+            unsigned(rev), unsigned(authorPeerId), unsigned(opType8), unsigned(payload.size()));
+        ui::execute_from_ui_thread([this, rev, authorPeerId, opType, payload] {
+          if (!m_doc)
+            return;
+          const std::string payloadStr = toString(payload);
+          Reader opReader(payloadStr);
+          switch (opType) {
+            case OpType::SetPixelsRect: {
+              uint32_t frame = 0;
+              uint32_t pathLen = 0;
+              std::vector<uint32_t> layerPath;
+              int32_t x = 0, y = 0, w = 0, h = 0;
+              std::vector<uint8_t> bytes;
+              if (!opReader.readU32(frame) || !opReader.readU32(pathLen))
+                return;
+              if (pathLen > 64)
+                return;
+              layerPath.reserve(pathLen);
+              for (uint32_t i = 0; i < pathLen; ++i) {
+                uint32_t idx = 0;
+                if (!opReader.readU32(idx))
+                  return;
+                layerPath.push_back(idx);
+              }
+              if (!opReader.readS32(x) || !opReader.readS32(y) || !opReader.readS32(w) ||
+                  !opReader.readS32(h))
+                return;
+              uint32_t nBytes = 0;
+              if (!opReader.readU32(nBytes))
+                return;
+              if (!opReader.ok(nBytes))
+                return;
+              bytes.assign(opReader.p, opReader.p + nBytes);
+              opReader.p += nBytes;
+              LOG(INFO, "PARTYKIT GUEST: Applying SetPixelsRect frame=%u rect=(%d,%d %dx%d)\n",
+                  unsigned(frame), x, y, w, h);
+              applySetPixelsRect(doc::frame_t(frame), layerPath, gfx::Rect(x, y, w, h), bytes);
+              break;
+            }
+            case OpType::NewFrame: {
+              std::string content;
+              uint32_t insertAt = 0;
+              if (!opReader.readString(content) || !opReader.readU32(insertAt))
+                return;
+              applyNewFrame(content, doc::frame_t(insertAt));
+              break;
+            }
+            case OpType::RemoveFrame: {
+              uint32_t frame = 0;
+              if (!opReader.readU32(frame))
+                return;
+              applyRemoveFrame(doc::frame_t(frame));
+              break;
+            }
+            case OpType::NewLayer: {
+              uint32_t pathLen = 0;
+              std::vector<uint32_t> afterPath;
+              std::string name;
+              if (!opReader.readU32(pathLen))
+                return;
+              if (pathLen > 64)
+                return;
+              afterPath.reserve(pathLen);
+              for (uint32_t i = 0; i < pathLen; ++i) {
+                uint32_t idx = 0;
+                if (!opReader.readU32(idx))
+                  return;
+                afterPath.push_back(idx);
+              }
+              if (!opReader.readString(name))
+                return;
+              applyNewLayer(afterPath, name);
+              break;
+            }
+            case OpType::RemoveLayer: {
+              uint32_t pathLen = 0;
+              std::vector<uint32_t> layerPath;
+              if (!opReader.readU32(pathLen))
+                return;
+              if (pathLen > 64)
+                return;
+              layerPath.reserve(pathLen);
+              for (uint32_t i = 0; i < pathLen; ++i) {
+                uint32_t idx = 0;
+                if (!opReader.readU32(idx))
+                  return;
+                layerPath.push_back(idx);
+              }
+              applyRemoveLayer(layerPath);
+              break;
+            }
+            case OpType::LayerLock: {
+              uint32_t pathLen = 0;
+              std::vector<uint32_t> layerPath;
+              uint8_t locked = 0;
+              if (!opReader.readU32(pathLen))
+                return;
+              if (pathLen > 64)
+                return;
+              layerPath.reserve(pathLen);
+              for (uint32_t i = 0; i < pathLen; ++i) {
+                uint32_t idx = 0;
+                if (!opReader.readU32(idx))
+                  return;
+                layerPath.push_back(idx);
+              }
+              if (!opReader.readU8(locked))
+                return;
+              applyLayerLock(layerPath, locked != 0);
+              break;
+            }
+          }
+        });
+        break;
+      }
+      default: break;
+    }
+  });
+
+  client->ws->start();
+  m_client = std::move(client);
+
+  appendChatLine(fmt::format("Connecting to room '{}'...", roomName));
+  updateWindow();
+  return true;
+}
+
+
 void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
                                                   const gfx::Region& dirtyArea)
 {
@@ -1308,9 +1876,19 @@ void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
     w.writeU32(1);
     w.writeU8(uint8_t(OpType::SetPixelsRect));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    m_host->broadcast(w.data);
-    if (base::get_log_level() >= VERBOSE)
-      LOG(VERBOSE, "ONLINE: sent Op(SetPixelsRect) rev=%u bytes=%u\n", unsigned(rev), unsigned(w.data.size()));
+
+    // In PartyKit mode, host sends via client connection to relay
+    if (m_connType == ConnectionType::PartyKit && m_client && m_client->ws) {
+      const ix::WebSocketSendInfo info = m_client->ws->sendBinary(toString(w.data));
+      if (base::get_log_level() >= VERBOSE)
+        LOG(VERBOSE, "ONLINE: sent Op(SetPixelsRect) via PartyKit rev=%u bytes=%u success=%d\n",
+            unsigned(rev), unsigned(w.data.size()), int(info.success));
+    }
+    else {
+      m_host->broadcast(w.data);
+      if (base::get_log_level() >= VERBOSE)
+        LOG(VERBOSE, "ONLINE: sent Op(SetPixelsRect) rev=%u bytes=%u\n", unsigned(rev), unsigned(w.data.size()));
+    }
   }
   else if (m_role == Role::Guest && m_client && m_client->ws) {
     Writer w;

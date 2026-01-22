@@ -213,6 +213,16 @@ Editor::Editor(Doc* document, EditorFlags flags, EditorStatePtr state)
 
   m_document->add_observer(this);
 
+  auto* mgr = online::OnlineSessionManager::instance();
+  m_clientCursorChangeConn = mgr->ClientCursorChange.connect(
+    [this](uint32_t peerId, const gfx::Point& oldPos, const gfx::Point& newPos){
+      onClientCursorChange(peerId, oldPos, newPos);
+    });
+  m_clientCursorHideConn = mgr->ClientCursorHide.connect(
+    [this](uint32_t peerId, const gfx::Point& pos){
+      onClientCursorHide(peerId, pos);
+    });
+
   m_state->onEnterState(this);
 }
 
@@ -3248,6 +3258,20 @@ void Editor::registerCommands()
     }
     app_refresh_screen();
   }));
+}
+
+void Editor::onClientCursorChange(uint32_t peerId, const gfx::Point& oldPos, const gfx::Point& newPos)
+{
+  auto* mgr = online::OnlineSessionManager::instance();
+  if (mgr->isActive() && mgr->document() == m_document)
+    invalidate();
+}
+
+void Editor::onClientCursorHide(uint32_t peerId, const gfx::Point& pos)
+{
+  auto* mgr = online::OnlineSessionManager::instance();
+  if (mgr->isActive() && mgr->document() == m_document)
+    invalidate();
 }
 
 } // namespace app

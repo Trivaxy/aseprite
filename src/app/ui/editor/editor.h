@@ -337,6 +337,8 @@ protected:
   void onTiledModeBeforeChange();
   void onTiledModeChange();
   void onShowExtrasChange();
+  void onClientCursorChange(uint32_t peerId, const gfx::Point& oldPos, const gfx::Point& newPos);
+  void onClientCursorHide(uint32_t peerId, const gfx::Point& pos);
 
   // DocObserver impl
   void onColorSpaceChanged(DocEvent& ev) override;
@@ -461,6 +463,8 @@ private:
   obs::scoped_connection m_bgConn;
   obs::scoped_connection m_onionskinConn;
   obs::scoped_connection m_symmetryModeConn;
+  obs::scoped_connection m_clientCursorChangeConn;
+  obs::scoped_connection m_clientCursorHideConn;
 
   EditorObservers m_observers;
 

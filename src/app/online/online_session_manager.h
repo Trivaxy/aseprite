@@ -13,6 +13,7 @@
 #include "gfx/point.h"
 #include "gfx/rect.h"
 #include "gfx/region.h"
+#include "obs/signal.h"
 
 #include <cstdint>
 #include <map>
@@ -104,6 +105,10 @@ public:
   void sendCursorHide();
   std::vector<Peer> peersWithVisibleCursors() const;
 
+  // Signals
+  obs::signal<void(uint32_t peerId, const gfx::Point& oldPos, const gfx::Point& newPos)> ClientCursorChange;
+  obs::signal<void(uint32_t peerId, const gfx::Point& pos)> ClientCursorHide;
+
 private:
   OnlineSessionManager();
   void stopNoLock();
@@ -172,6 +177,14 @@ private:
 private:
   mutable std::recursive_mutex m_mutex;
 
+  struct PendingCursorSignal {
+    enum class Type { Change, Hide };
+    Type type = Type::Change;
+    uint32_t peerId = 0;
+    gfx::Point oldPos;
+    gfx::Point newPos;
+  };
+
   Role m_role = Role::None;
   ConnectionType m_connType = ConnectionType::None;
   Doc* m_doc = nullptr;
@@ -201,6 +214,8 @@ private:
   gfx::Point m_pendingCursorPos{0, 0};
   bool m_cursorDirty = false;
   bool m_cursorWasVisible = false;
+
+  std::vector<PendingCursorSignal> m_pendingCursorSignals;
 };
 
 } // namespace app::online

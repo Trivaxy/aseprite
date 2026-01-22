@@ -392,20 +392,35 @@ void OnlineSessionManager::setupTransportCallbacks()
 
 void OnlineSessionManager::handleMessage(uint32_t senderPeerId, const std::string& data)
 {
-  std::lock_guard lock(m_mutex);
+  std::vector<PendingCursorSignal> pendingSignals;
+  {
+    std::unique_lock lock(m_mutex);
 
-  Reader r(data);
-  uint8_t type8 = 0;
-  if (!r.readU8(type8))
-    return;
+    Reader r(data);
+    uint8_t type8 = 0;
+    if (r.readU8(type8)) {
+      const auto type = MsgType(type8);
 
-  const auto type = MsgType(type8);
+      if (m_role == Role::Host) {
+        handleHostMessage(senderPeerId, type, r);
+      }
+      else if (m_role == Role::Guest) {
+        handleGuestMessage(type, r);
+      }
+    }
 
-  if (m_role == Role::Host) {
-    handleHostMessage(senderPeerId, type, r);
+    pendingSignals.swap(m_pendingCursorSignals);
   }
-  else if (m_role == Role::Guest) {
-    handleGuestMessage(type, r);
+
+  for (const auto& sig : pendingSignals) {
+    switch (sig.type) {
+      case PendingCursorSignal::Type::Change:
+        ClientCursorChange(sig.peerId, sig.oldPos, sig.newPos);
+        break;
+      case PendingCursorSignal::Type::Hide:
+        ClientCursorHide(sig.peerId, sig.newPos);
+        break;
+    }
   }
 }
 
@@ -886,8 +901,12 @@ void OnlineSessionManager::handleCursorPosition(uint32_t senderPeerId, Reader& r
   // Update stored cursor position
   auto peerIt = m_peers.find(peerId);
   if (peerIt != m_peers.end()) {
-    peerIt->second.cursorPos = gfx::Point(x, y);
+    gfx::Point oldPos = peerIt->second.cursorPos;
+    gfx::Point newPos(x, y);
+    peerIt->second.cursorPos = newPos;
     peerIt->second.cursorVisible = true;
+    m_pendingCursorSignals.push_back(
+      { PendingCursorSignal::Type::Change, peerId, oldPos, newPos });
   }
 
   // Broadcast to all clients
@@ -912,7 +931,9 @@ void OnlineSessionManager::handleCursorHide(uint32_t senderPeerId, Reader& r)
   // Update stored cursor visibility
   auto peerIt = m_peers.find(peerId);
   if (peerIt != m_peers.end()) {
+    gfx::Point pos = peerIt->second.cursorPos;
     peerIt->second.cursorVisible = false;
+    m_pendingCursorSignals.push_back({ PendingCursorSignal::Type::Hide, peerId, pos, pos });
   }
 
   // Broadcast to all clients
@@ -1150,8 +1171,12 @@ void OnlineSessionManager::onCursorPosition(uint32_t peerId, int32_t x, int32_t 
 {
   auto it = m_peers.find(peerId);
   if (it != m_peers.end()) {
-    it->second.cursorPos = gfx::Point(x, y);
+    gfx::Point oldPos = it->second.cursorPos;
+    gfx::Point newPos(x, y);
+    it->second.cursorPos = newPos;
     it->second.cursorVisible = true;
+    m_pendingCursorSignals.push_back(
+      { PendingCursorSignal::Type::Change, peerId, oldPos, newPos });
   }
 }
 
@@ -1159,7 +1184,9 @@ void OnlineSessionManager::onCursorHide(uint32_t peerId)
 {
   auto it = m_peers.find(peerId);
   if (it != m_peers.end()) {
+    gfx::Point pos = it->second.cursorPos;
     it->second.cursorVisible = false;
+    m_pendingCursorSignals.push_back({ PendingCursorSignal::Type::Hide, peerId, pos, pos });
   }
 }
 

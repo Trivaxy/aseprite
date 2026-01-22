@@ -16,6 +16,7 @@
 #include "app/doc_api.h"
 #include "app/file/file.h"
 #include "app/online/online_protocol.h"
+#include "app/online/transport.h"
 #include "app/site.h"
 #include "app/tools/ink.h"
 #include "app/tools/tool_loop.h"
@@ -37,8 +38,6 @@
 #include <algorithm>
 #include <cstring>
 #include <ixwebsocket/IXNetSystem.h>
-#include <ixwebsocket/IXWebSocket.h>
-#include <ixwebsocket/IXWebSocketServer.h>
 
 namespace app::online {
 
@@ -158,67 +157,9 @@ private:
 
 } // namespace
 
-struct OnlineSessionManager::NetHost {
-  std::unique_ptr<ix::WebSocketServer> server;
-  std::vector<uint8_t> snapshotBytes;
-
-  struct ClientConn {
-    std::weak_ptr<ix::WebSocket> wsWeak;
-    Permissions perms = 0; // viewer
-    std::string username;
-    bool authenticated = false;
-  };
-
-  std::string password;
-
-  std::map<uint32_t, ClientConn> clients;
-  uint32_t nextPeerId = 2; // host is 1
-
-  void broadcast(const std::vector<uint8_t>& bytes)
-  {
-    const std::string payload = toString(bytes);
-    uint32_t ok = 0;
-    uint32_t failed = 0;
-    for (auto& [peerId, conn] : clients) {
-      if (auto ws = conn.wsWeak.lock()) {
-        const ix::WebSocketSendInfo info = ws->sendBinary(payload);
-        if (info.success)
-          ++ok;
-        else {
-          ++failed;
-          LOG(WARNING,
-              "ONLINE: broadcast send failed to peer=%u ready=%s buffered=%u\n",
-              unsigned(peerId),
-              ix::WebSocket::readyStateToString(ws->getReadyState()).c_str(),
-              unsigned(ws->bufferedAmount()));
-        }
-      }
-    }
-    if (failed && base::get_log_level() >= VERBOSE) {
-      LOG(VERBOSE,
-          "ONLINE: broadcast stats ok=%u failed=%u bytes=%u\n",
-          unsigned(ok),
-          unsigned(failed),
-          unsigned(payload.size()));
-    }
-  }
-
-  void sendTo(uint32_t peerId, const std::vector<uint8_t>& bytes)
-  {
-    auto it = clients.find(peerId);
-    if (it == clients.end())
-      return;
-    if (auto ws = it->second.wsWeak.lock())
-      ws->sendBinary(toString(bytes));
-  }
-};
-
-struct OnlineSessionManager::NetClient {
-  std::unique_ptr<ix::WebSocket> ws;
-  std::string url;
-  std::string username;
-  std::string password;
-};
+//------------------------------------------------------------------------------
+// OnlineSessionManager - Singleton
+//------------------------------------------------------------------------------
 
 OnlineSessionManager* OnlineSessionManager::instance()
 {
@@ -334,26 +275,919 @@ void OnlineSessionManager::stopNoLock()
   if (m_doc)
     m_doc->setOnlineSessionReadOnly(false);
 
-  if (m_client && m_client->ws)
-    m_client->ws->stop();
-  if (m_host && m_host->server)
-    m_host->server->stop();
+  if (m_transport)
+    m_transport->stop();
 
-  m_host.reset();
-  m_client.reset();
+  m_transport.reset();
 
   m_role = Role::None;
   m_connType = ConnectionType::None;
   m_doc = nullptr;
+  m_ctx = nullptr;
   m_roomName.clear();
+  m_localUsername.clear();
+  m_password.clear();
   m_localPeerId = 0;
   m_localPerms = 0;
   m_peers.clear();
+  m_hostPeerInfo.clear();
+  m_snapshotBytes.clear();
   m_pendingSnapshot = PendingSnapshot();
   m_chatLog.clear();
   m_nextClientOpId = 1;
   m_nextRev = 1;
+  m_nextPeerId = 2;
 }
+
+//------------------------------------------------------------------------------
+// Transport callback setup - unified for all transport types
+//------------------------------------------------------------------------------
+
+void OnlineSessionManager::setupTransportCallbacks()
+{
+  if (!m_transport)
+    return;
+
+  m_transport->setOnMessage([this](uint32_t peerId, const std::string& data) {
+    ui::execute_from_ui_thread([this, peerId, data] {
+      handleMessage(peerId, data);
+    });
+  });
+
+  m_transport->setOnPeerConnected([this](uint32_t peerId) {
+    ui::execute_from_ui_thread([this, peerId] {
+      std::lock_guard lock(m_mutex);
+      // Peer connected but not yet authenticated (Direct mode only)
+      // PartyKit handles this differently via Hello message
+      if (m_role == Role::Host && m_connType == ConnectionType::Direct) {
+        m_hostPeerInfo[peerId] = HostPeerInfo{};
+      }
+    });
+  });
+
+  m_transport->setOnPeerDisconnected([this](uint32_t peerId) {
+    ui::execute_from_ui_thread([this, peerId] {
+      std::lock_guard lock(m_mutex);
+      if (m_role == Role::Host) {
+        auto it = m_hostPeerInfo.find(peerId);
+        if (it != m_hostPeerInfo.end()) {
+          bool wasAuth = it->second.authenticated;
+          std::string name = it->second.username;
+          m_hostPeerInfo.erase(it);
+          m_peers.erase(peerId);
+          if (wasAuth) {
+            appendChatLine(fmt::format("{} disconnected.", name.empty() ? fmt::format("Guest {}", peerId) : name));
+            updateWindow();
+          }
+        }
+      }
+    });
+  });
+
+  m_transport->setOnConnected([this]() {
+    ui::execute_from_ui_thread([this] {
+      std::lock_guard lock(m_mutex);
+      if (m_role == Role::Host) {
+        // Host is now ready to receive connections
+        if (m_connType == ConnectionType::PartyKit) {
+          appendChatLine(fmt::format("Hosting room '{}'", m_roomName));
+        }
+        else {
+          appendChatLine("Server started.");
+        }
+      }
+      else if (m_role == Role::Guest) {
+        // Guest connected, send Hello
+        appendChatLine("Connected. Sending credentials...");
+        Writer w;
+        w.writeU8(uint8_t(MsgType::Hello));
+        w.writeString(m_localUsername);
+        w.writeString(m_password);
+        sendToHost(w.data);
+      }
+      updateWindow();
+    });
+  });
+
+  m_transport->setOnDisconnected([this](const std::string& reason) {
+    ui::execute_from_ui_thread([this, reason] {
+      std::lock_guard lock(m_mutex);
+      appendChatLine(fmt::format("Disconnected: {}", reason));
+      updateWindow();
+    });
+  });
+
+  m_transport->setOnError([this](const std::string& error) {
+    ui::execute_from_ui_thread([this, error] {
+      std::lock_guard lock(m_mutex);
+      appendChatLine(fmt::format("Error: {}", error));
+      updateWindow();
+    });
+  });
+}
+
+//------------------------------------------------------------------------------
+// Unified message handling
+//------------------------------------------------------------------------------
+
+void OnlineSessionManager::handleMessage(uint32_t senderPeerId, const std::string& data)
+{
+  std::lock_guard lock(m_mutex);
+
+  Reader r(data);
+  uint8_t type8 = 0;
+  if (!r.readU8(type8))
+    return;
+
+  const auto type = MsgType(type8);
+
+  if (m_role == Role::Host) {
+    handleHostMessage(senderPeerId, type, r);
+  }
+  else if (m_role == Role::Guest) {
+    handleGuestMessage(type, r);
+  }
+}
+
+void OnlineSessionManager::handleHostMessage(uint32_t senderPeerId, MsgType type, Reader& r)
+{
+  // In Direct mode, senderPeerId is the actual peer ID from the transport layer.
+  // In PartyKit mode, newer relays/transports can provide a stable senderPeerId too.
+  // Keep fallback logic for senderPeerId==0 for older PartyKit relays.
+
+  switch (type) {
+    case MsgType::Hello:
+      handleHello(senderPeerId, r);
+      break;
+
+    case MsgType::OpPropose:
+      handleOpPropose(senderPeerId, r);
+      break;
+
+    case MsgType::ChatSend:
+      handleChatSend(senderPeerId, r);
+      break;
+
+    case MsgType::CursorPosition:
+      handleCursorPosition(senderPeerId, r);
+      break;
+
+    case MsgType::CursorHide:
+      handleCursorHide(senderPeerId, r);
+      break;
+
+    default:
+      break;
+  }
+}
+
+void OnlineSessionManager::handleGuestMessage(MsgType type, Reader& r)
+{
+  switch (type) {
+    case MsgType::Error: {
+      std::string text;
+      if (r.readString(text)) {
+        ui::Alert::show(fmt::format("Connection Error<<{}", text));
+      }
+      break;
+    }
+
+    case MsgType::Welcome: {
+      uint32_t peerId = 0;
+      uint32_t perms = 0;
+      if (r.readU32(peerId) && r.readU32(perms)) {
+        onWelcome(peerId, perms);
+      }
+      break;
+    }
+
+    case MsgType::SnapshotBegin: {
+      uint32_t sizeBytes = 0;
+      if (r.readU32(sizeBytes)) {
+        onSnapshotBegin(sizeBytes);
+      }
+      break;
+    }
+
+    case MsgType::SnapshotData: {
+      std::vector<uint8_t> chunk;
+      if (r.readBytes(chunk)) {
+        onSnapshotData(chunk);
+      }
+      break;
+    }
+
+    case MsgType::SnapshotEnd: {
+      onSnapshotEnd();
+      break;
+    }
+
+    case MsgType::Op: {
+      uint64_t rev = 0;
+      uint32_t authorPeerId = 0;
+      uint8_t opType8 = 0;
+      if (r.readU64(rev) && r.readU32(authorPeerId) && r.readU8(opType8)) {
+        const auto opType = OpType(opType8);
+        onOp(rev, authorPeerId, opType, r);
+      }
+      break;
+    }
+
+    case MsgType::PermissionsSet: {
+      uint32_t peerId = 0;
+      uint32_t perms = 0;
+      if (r.readU32(peerId) && r.readU32(perms)) {
+        onPermissionsSet(peerId, perms);
+      }
+      break;
+    }
+
+    case MsgType::Kick: {
+      std::string reason;
+      r.readString(reason);
+      onKick(reason);
+      break;
+    }
+
+    case MsgType::ChatBroadcast: {
+      uint32_t peerId = 0;
+      std::string text;
+      if (r.readU32(peerId) && r.readString(text)) {
+        onChatBroadcast(peerId, text);
+      }
+      break;
+    }
+
+    case MsgType::CursorPosition: {
+      uint32_t peerId = 0;
+      int32_t x = 0, y = 0;
+      if (r.readU32(peerId) && r.readS32(x) && r.readS32(y)) {
+        onCursorPosition(peerId, x, y);
+      }
+      break;
+    }
+
+    case MsgType::CursorHide: {
+      uint32_t peerId = 0;
+      if (r.readU32(peerId)) {
+        onCursorHide(peerId);
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+//------------------------------------------------------------------------------
+// Host-side message handlers
+//------------------------------------------------------------------------------
+
+void OnlineSessionManager::handleHello(uint32_t senderPeerId, Reader& r)
+{
+  std::string user, pass;
+  if (!r.readString(user) || !r.readString(pass))
+    return;
+
+  LOG(INFO, "ONLINE: Received Hello from user='%s'\n", user.c_str());
+
+  // Validate Password
+  if (!m_password.empty() && m_password != pass) {
+    Writer w;
+    w.writeU8(uint8_t(MsgType::Error));
+    w.writeString("Invalid password");
+    if (senderPeerId != 0) {
+      sendToPeer(senderPeerId, w.data);
+    }
+    else {
+      broadcastMessage(w.data);
+    }
+    return;
+  }
+
+  // Validate Username
+  for (const auto& [id, p] : m_peers) {
+    if (p.name == user) {
+      Writer w;
+      w.writeU8(uint8_t(MsgType::Error));
+      w.writeString("Username taken");
+      if (senderPeerId != 0) {
+        sendToPeer(senderPeerId, w.data);
+      }
+      else {
+        broadcastMessage(w.data);
+      }
+      return;
+    }
+  }
+
+  uint32_t peerId = senderPeerId;
+  if (peerId == 0) {
+    peerId = m_nextPeerId++;
+  }
+
+  // Register the peer
+  m_hostPeerInfo[peerId] = HostPeerInfo{ 0, user, true };
+  m_peers[peerId] = Peer{ peerId, 0, user };
+
+  // Send Welcome
+  Writer w;
+  w.writeU8(uint8_t(MsgType::Welcome));
+  w.writeU32(peerId);
+  w.writeU32(0); // Default permissions (viewer)
+  sendToPeer(peerId, w.data);
+
+  // Send snapshot
+  {
+    Writer wb;
+    wb.writeU8(uint8_t(MsgType::SnapshotBegin));
+    wb.writeU32(uint32_t(m_snapshotBytes.size()));
+    sendToPeer(peerId, wb.data);
+  }
+
+  static constexpr size_t kChunkSize = 128 * 1024;
+  size_t offset = 0;
+  while (offset < m_snapshotBytes.size()) {
+    const size_t remaining = m_snapshotBytes.size() - offset;
+    const size_t n = (remaining < kChunkSize ? remaining : kChunkSize);
+    std::vector<uint8_t> chunk(m_snapshotBytes.begin() + offset, m_snapshotBytes.begin() + offset + n);
+    Writer wd;
+    wd.writeU8(uint8_t(MsgType::SnapshotData));
+    wd.writeBytes(chunk);
+    sendToPeer(peerId, wd.data);
+    offset += n;
+  }
+
+  {
+    Writer we;
+    we.writeU8(uint8_t(MsgType::SnapshotEnd));
+    sendToPeer(peerId, we.data);
+  }
+
+  appendChatLine(fmt::format("{} connected.", user));
+  updateWindow();
+}
+
+void OnlineSessionManager::handleOpPropose(uint32_t senderPeerId, Reader& r)
+{
+  uint32_t claimedPeerId = 0;
+  uint64_t clientOpId = 0;
+  uint8_t opType8 = 0;
+  if (!r.readU32(claimedPeerId) || !r.readU64(clientOpId) || !r.readU8(opType8))
+    return;
+
+  // For PartyKit, use claimed peerId; for Direct, verify it matches
+  uint32_t peerId = (senderPeerId == 0) ? claimedPeerId : senderPeerId;
+  if (senderPeerId != 0 && claimedPeerId != senderPeerId)
+    return;
+
+  const auto opType = OpType(opType8);
+  const std::vector<uint8_t> payload(r.p, r.end);
+
+  if (!m_doc)
+    return;
+
+  // Permission check (host authoritative)
+  Permissions required = 0;
+  switch (opType) {
+    case OpType::SetPixelsRect: required = kPermEditCanvas; break;
+    case OpType::NewFrame:
+    case OpType::RemoveFrame: required = kPermEditTimeline; break;
+    case OpType::NewLayer:
+    case OpType::RemoveLayer: required = kPermEditLayers; break;
+    case OpType::LayerLock: required = kPermLockLayers; break;
+  }
+
+  auto it = m_hostPeerInfo.find(peerId);
+  if (it == m_hostPeerInfo.end())
+    return;
+  if ((it->second.perms & required) != required) {
+    Writer rej;
+    rej.writeU8(uint8_t(MsgType::OpRejected));
+    rej.writeU64(clientOpId);
+    rej.writeString("Permission denied");
+    sendToPeer(peerId, rej.data);
+    return;
+  }
+
+  // Decode + apply the operation
+  const std::string payloadStr = toString(payload);
+  Reader opReader(payloadStr);
+  bool ok = true;
+
+  switch (opType) {
+    case OpType::SetPixelsRect: {
+      uint32_t frame = 0;
+      uint32_t pathLen = 0;
+      std::vector<uint32_t> layerPath;
+      int32_t x = 0, y = 0, w = 0, h = 0;
+      std::vector<uint8_t> bytes;
+      if (!opReader.readU32(frame) || !opReader.readU32(pathLen)) {
+        ok = false;
+        break;
+      }
+      if (pathLen > 64) {
+        ok = false;
+        break;
+      }
+      layerPath.reserve(pathLen);
+      for (uint32_t i = 0; i < pathLen; ++i) {
+        uint32_t idx = 0;
+        if (!opReader.readU32(idx)) {
+          ok = false;
+          break;
+        }
+        layerPath.push_back(idx);
+      }
+      if (!ok)
+        break;
+      if (!opReader.readS32(x) || !opReader.readS32(y) || !opReader.readS32(w) ||
+          !opReader.readS32(h) || !opReader.readBytes(bytes)) {
+        ok = false;
+        break;
+      }
+
+      auto* sprite = m_doc->sprite();
+      doc::Layer* layer = resolveLayerPath(sprite, layerPath);
+      if (!layer || !layer->isImage() || !layer->isEditable()) {
+        ok = false;
+        break;
+      }
+
+      applySetPixelsRect(doc::frame_t(frame), layerPath, gfx::Rect(x, y, w, h), bytes);
+      break;
+    }
+    case OpType::NewFrame: {
+      std::string content;
+      uint32_t insertAt = 0;
+      if (!opReader.readString(content) || !opReader.readU32(insertAt)) {
+        ok = false;
+        break;
+      }
+      applyNewFrame(content, doc::frame_t(insertAt));
+      break;
+    }
+    case OpType::RemoveFrame: {
+      uint32_t frame = 0;
+      if (!opReader.readU32(frame)) {
+        ok = false;
+        break;
+      }
+      applyRemoveFrame(doc::frame_t(frame));
+      break;
+    }
+    case OpType::NewLayer: {
+      uint32_t pathLen = 0;
+      std::vector<uint32_t> afterPath;
+      std::string name;
+      if (!opReader.readU32(pathLen)) {
+        ok = false;
+        break;
+      }
+      if (pathLen > 64) {
+        ok = false;
+        break;
+      }
+      afterPath.reserve(pathLen);
+      for (uint32_t i = 0; i < pathLen; ++i) {
+        uint32_t idx = 0;
+        if (!opReader.readU32(idx)) {
+          ok = false;
+          break;
+        }
+        afterPath.push_back(idx);
+      }
+      if (!ok)
+        break;
+      if (!opReader.readString(name)) {
+        ok = false;
+        break;
+      }
+      applyNewLayer(afterPath, name);
+      break;
+    }
+    case OpType::RemoveLayer: {
+      uint32_t pathLen = 0;
+      std::vector<uint32_t> layerPath;
+      if (!opReader.readU32(pathLen)) {
+        ok = false;
+        break;
+      }
+      if (pathLen > 64) {
+        ok = false;
+        break;
+      }
+      layerPath.reserve(pathLen);
+      for (uint32_t i = 0; i < pathLen; ++i) {
+        uint32_t idx = 0;
+        if (!opReader.readU32(idx)) {
+          ok = false;
+          break;
+        }
+        layerPath.push_back(idx);
+      }
+      if (!ok)
+        break;
+      applyRemoveLayer(layerPath);
+      break;
+    }
+    case OpType::LayerLock: {
+      uint32_t pathLen = 0;
+      std::vector<uint32_t> layerPath;
+      uint8_t locked = 0;
+      if (!opReader.readU32(pathLen)) {
+        ok = false;
+        break;
+      }
+      if (pathLen > 64) {
+        ok = false;
+        break;
+      }
+      layerPath.reserve(pathLen);
+      for (uint32_t i = 0; i < pathLen; ++i) {
+        uint32_t idx = 0;
+        if (!opReader.readU32(idx)) {
+          ok = false;
+          break;
+        }
+        layerPath.push_back(idx);
+      }
+      if (!ok)
+        break;
+      if (!opReader.readU8(locked)) {
+        ok = false;
+        break;
+      }
+      applyLayerLock(layerPath, locked != 0);
+      break;
+    }
+  }
+
+  if (!ok) {
+    Writer rej;
+    rej.writeU8(uint8_t(MsgType::OpRejected));
+    rej.writeU64(clientOpId);
+    rej.writeString("Invalid operation");
+    sendToPeer(peerId, rej.data);
+    return;
+  }
+
+  // Broadcast accepted op
+  Writer w;
+  w.writeU8(uint8_t(MsgType::Op));
+  w.writeU64(m_nextRev++);
+  w.writeU32(peerId);
+  w.writeU8(uint8_t(opType));
+  w.data.insert(w.data.end(), payload.begin(), payload.end());
+  broadcastMessage(w.data);
+}
+
+void OnlineSessionManager::handleChatSend(uint32_t senderPeerId, Reader& r)
+{
+  uint32_t claimedPeerId = 0;
+  std::string text;
+  if (!r.readU32(claimedPeerId) || !r.readString(text))
+    return;
+
+  uint32_t peerId = (senderPeerId == 0) ? claimedPeerId : senderPeerId;
+  if (senderPeerId != 0 && claimedPeerId != senderPeerId)
+    return;
+
+  // Broadcast chat
+  Writer w;
+  w.writeU8(uint8_t(MsgType::ChatBroadcast));
+  w.writeU32(peerId);
+  w.writeString(text);
+  broadcastMessage(w.data);
+
+  appendChatLine(fmt::format("[{}] {}", peerId, text));
+  updateWindow();
+}
+
+void OnlineSessionManager::handleCursorPosition(uint32_t senderPeerId, Reader& r)
+{
+  uint32_t claimedPeerId = 0;
+  int32_t x = 0, y = 0;
+  if (!r.readU32(claimedPeerId) || !r.readS32(x) || !r.readS32(y))
+    return;
+
+  uint32_t peerId = (senderPeerId == 0) ? claimedPeerId : senderPeerId;
+  if (senderPeerId != 0 && claimedPeerId != senderPeerId)
+    return;
+
+  // Validate peer has canvas edit permission
+  auto it = m_hostPeerInfo.find(peerId);
+  if (it == m_hostPeerInfo.end())
+    return;
+  if ((it->second.perms & kPermEditCanvas) == 0)
+    return;
+
+  // Update stored cursor position
+  auto peerIt = m_peers.find(peerId);
+  if (peerIt != m_peers.end()) {
+    peerIt->second.cursorPos = gfx::Point(x, y);
+    peerIt->second.cursorVisible = true;
+  }
+
+  // Broadcast to all clients
+  Writer w;
+  w.writeU8(uint8_t(MsgType::CursorPosition));
+  w.writeU32(peerId);
+  w.writeS32(x);
+  w.writeS32(y);
+  broadcastMessage(w.data);
+}
+
+void OnlineSessionManager::handleCursorHide(uint32_t senderPeerId, Reader& r)
+{
+  uint32_t claimedPeerId = 0;
+  if (!r.readU32(claimedPeerId))
+    return;
+
+  uint32_t peerId = (senderPeerId == 0) ? claimedPeerId : senderPeerId;
+  if (senderPeerId != 0 && claimedPeerId != senderPeerId)
+    return;
+
+  // Update stored cursor visibility
+  auto peerIt = m_peers.find(peerId);
+  if (peerIt != m_peers.end()) {
+    peerIt->second.cursorVisible = false;
+  }
+
+  // Broadcast to all clients
+  Writer w;
+  w.writeU8(uint8_t(MsgType::CursorHide));
+  w.writeU32(peerId);
+  broadcastMessage(w.data);
+}
+
+//------------------------------------------------------------------------------
+// Guest-side response handlers
+//------------------------------------------------------------------------------
+
+void OnlineSessionManager::onWelcome(uint32_t peerId, Permissions perms)
+{
+  if (m_localPeerId != 0 && m_localPeerId != peerId)
+    return;
+
+  m_localPeerId = peerId;
+  m_localPerms = perms;
+  m_peers[1] = Peer{ 1, kPermEditCanvas | kPermEditLayers | kPermLockLayers | kPermEditTimeline, "Host" };
+  std::string name = "You";
+  if (!m_localUsername.empty())
+    name = fmt::format("{} ({})", m_localUsername, peerId);
+  else
+    name = fmt::format("You ({})", peerId);
+
+  m_peers[peerId] = Peer{ peerId, perms, name };
+  appendChatLine(fmt::format("Connected. Permissions: {}", perms));
+  updateWindow();
+}
+
+void OnlineSessionManager::onSnapshotBegin(uint32_t sizeBytes)
+{
+  m_pendingSnapshot.inProgress = true;
+  m_pendingSnapshot.sizeBytes = sizeBytes;
+  m_pendingSnapshot.bytes.clear();
+  m_pendingSnapshot.bytes.reserve(sizeBytes);
+  appendChatLine(fmt::format("Receiving snapshot ({} bytes)...", sizeBytes));
+  updateWindow();
+}
+
+void OnlineSessionManager::onSnapshotData(const std::vector<uint8_t>& chunk)
+{
+  if (!m_pendingSnapshot.inProgress)
+    return;
+  m_pendingSnapshot.bytes.insert(m_pendingSnapshot.bytes.end(), chunk.begin(), chunk.end());
+}
+
+void OnlineSessionManager::onSnapshotEnd()
+{
+  m_pendingSnapshot.inProgress = false;
+  std::vector<uint8_t> bytes;
+  bytes.swap(m_pendingSnapshot.bytes);
+  appendChatLine("Snapshot received.");
+
+  if (!m_ctx) {
+    ui::Alert::show("Cannot load snapshot (no context).");
+    return;
+  }
+  if (bytes.empty()) {
+    ui::Alert::show("Cannot load snapshot (empty).");
+    return;
+  }
+
+  const std::string fn = snapshotFilename();
+  base::make_all_directories(base::get_file_path(fn));
+  if (!writeFileBytes(fn, bytes)) {
+    ui::Alert::show("Cannot write snapshot file.");
+    return;
+  }
+
+  std::unique_ptr<Doc> doc(load_document(m_ctx, fn));
+  if (!doc) {
+    ui::Alert::show("Cannot load snapshot.");
+    return;
+  }
+
+  Doc* raw = doc.release();
+  raw->setContext(m_ctx);
+  m_ctx->documents().add(raw);
+  m_ctx->setActiveDocument(raw);
+
+  m_doc = raw;
+  raw->setOnlineSessionReadOnly(m_localPerms == 0);
+
+  updateWindow();
+}
+
+void OnlineSessionManager::onOp(uint64_t rev, uint32_t authorPeerId, OpType opType, Reader& opReader)
+{
+  if (!m_doc)
+    return;
+
+  if (base::get_log_level() >= VERBOSE) {
+    LOG(VERBOSE,
+        "ONLINE: recv Op: rev=%u author=%u type=%u\n",
+        unsigned(rev),
+        unsigned(authorPeerId),
+        unsigned(opType));
+  }
+
+  switch (opType) {
+    case OpType::SetPixelsRect: {
+      uint32_t frame = 0;
+      uint32_t pathLen = 0;
+      std::vector<uint32_t> layerPath;
+      int32_t x = 0, y = 0, w = 0, h = 0;
+      std::vector<uint8_t> bytes;
+      if (!opReader.readU32(frame) || !opReader.readU32(pathLen))
+        return;
+      if (pathLen > 64)
+        return;
+      layerPath.reserve(pathLen);
+      for (uint32_t i = 0; i < pathLen; ++i) {
+        uint32_t idx = 0;
+        if (!opReader.readU32(idx))
+          return;
+        layerPath.push_back(idx);
+      }
+      if (!opReader.readS32(x) || !opReader.readS32(y) || !opReader.readS32(w) || !opReader.readS32(h))
+        return;
+      uint32_t nBytes = 0;
+      if (!opReader.readU32(nBytes))
+        return;
+      if (!opReader.ok(nBytes))
+        return;
+      bytes.assign(opReader.p, opReader.p + nBytes);
+      opReader.p += nBytes;
+      applySetPixelsRect(doc::frame_t(frame), layerPath, gfx::Rect(x, y, w, h), bytes);
+      break;
+    }
+    case OpType::NewFrame: {
+      std::string content;
+      uint32_t insertAt = 0;
+      if (!opReader.readString(content) || !opReader.readU32(insertAt))
+        return;
+      applyNewFrame(content, doc::frame_t(insertAt));
+      break;
+    }
+    case OpType::RemoveFrame: {
+      uint32_t frame = 0;
+      if (!opReader.readU32(frame))
+        return;
+      applyRemoveFrame(doc::frame_t(frame));
+      break;
+    }
+    case OpType::NewLayer: {
+      uint32_t pathLen = 0;
+      std::vector<uint32_t> afterPath;
+      std::string name;
+      if (!opReader.readU32(pathLen))
+        return;
+      if (pathLen > 64)
+        return;
+      afterPath.reserve(pathLen);
+      for (uint32_t i = 0; i < pathLen; ++i) {
+        uint32_t idx = 0;
+        if (!opReader.readU32(idx))
+          return;
+        afterPath.push_back(idx);
+      }
+      if (!opReader.readString(name))
+        return;
+      applyNewLayer(afterPath, name);
+      break;
+    }
+    case OpType::RemoveLayer: {
+      uint32_t pathLen = 0;
+      std::vector<uint32_t> layerPath;
+      if (!opReader.readU32(pathLen))
+        return;
+      if (pathLen > 64)
+        return;
+      layerPath.reserve(pathLen);
+      for (uint32_t i = 0; i < pathLen; ++i) {
+        uint32_t idx = 0;
+        if (!opReader.readU32(idx))
+          return;
+        layerPath.push_back(idx);
+      }
+      applyRemoveLayer(layerPath);
+      break;
+    }
+    case OpType::LayerLock: {
+      uint32_t pathLen = 0;
+      std::vector<uint32_t> layerPath;
+      uint8_t locked = 0;
+      if (!opReader.readU32(pathLen))
+        return;
+      if (pathLen > 64)
+        return;
+      layerPath.reserve(pathLen);
+      for (uint32_t i = 0; i < pathLen; ++i) {
+        uint32_t idx = 0;
+        if (!opReader.readU32(idx))
+          return;
+        layerPath.push_back(idx);
+      }
+      if (!opReader.readU8(locked))
+        return;
+      applyLayerLock(layerPath, locked != 0);
+      break;
+    }
+  }
+}
+
+void OnlineSessionManager::onPermissionsSet(uint32_t peerId, Permissions perms)
+{
+  auto& p = m_peers[peerId];
+  p.id = peerId;
+  p.perms = perms;
+  if (peerId == m_localPeerId) {
+    m_localPerms = perms;
+    if (m_doc)
+      m_doc->setOnlineSessionReadOnly(m_localPerms == 0);
+    appendChatLine(fmt::format("Permissions updated: {}", perms));
+  }
+  updateWindow();
+}
+
+void OnlineSessionManager::onKick(const std::string& reason)
+{
+  ui::Alert::show(fmt::format("You were kicked.\n{}", reason).c_str());
+  leave();
+}
+
+void OnlineSessionManager::onChatBroadcast(uint32_t peerId, const std::string& text)
+{
+  appendChatLine(fmt::format("[{}] {}", peerId, text));
+  updateWindow();
+}
+
+void OnlineSessionManager::onCursorPosition(uint32_t peerId, int32_t x, int32_t y)
+{
+  auto it = m_peers.find(peerId);
+  if (it != m_peers.end()) {
+    it->second.cursorPos = gfx::Point(x, y);
+    it->second.cursorVisible = true;
+  }
+}
+
+void OnlineSessionManager::onCursorHide(uint32_t peerId)
+{
+  auto it = m_peers.find(peerId);
+  if (it != m_peers.end()) {
+    it->second.cursorVisible = false;
+  }
+}
+
+//------------------------------------------------------------------------------
+// Transport helpers
+//------------------------------------------------------------------------------
+
+void OnlineSessionManager::broadcastMessage(const std::vector<uint8_t>& data)
+{
+  if (m_transport)
+    m_transport->broadcast(data);
+}
+
+void OnlineSessionManager::sendToHost(const std::vector<uint8_t>& data)
+{
+  if (m_transport)
+    m_transport->send(data);
+}
+
+void OnlineSessionManager::sendToPeer(uint32_t peerId, const std::vector<uint8_t>& data)
+{
+  if (m_transport)
+    m_transport->sendTo(peerId, data);
+}
+
+//------------------------------------------------------------------------------
+// Public API: Start/Join/Leave
+//------------------------------------------------------------------------------
 
 bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std::string& username, const std::string& password, const std::string& bindAddress)
 {
@@ -365,479 +1199,37 @@ bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std
   std::lock_guard lock(m_mutex);
   stopNoLock();
 
-  auto host = std::make_unique<NetHost>();
-  host->snapshotBytes = buildSnapshotBytes(doc);
-  if (host->snapshotBytes.empty()) {
+  m_snapshotBytes = buildSnapshotBytes(doc);
+  if (m_snapshotBytes.empty()) {
     ui::Alert::show("Failed to build snapshot.");
     stopNoLock();
     return false;
   }
 
-  host->password = password;
-
   m_role = Role::Host;
+  m_connType = ConnectionType::Direct;
   m_doc = doc;
+  m_ctx = ctx;
+  m_localUsername = username.empty() ? "Host" : username;
+  m_password = password;
   m_localPeerId = 1;
   m_localPerms = (kPermEditCanvas | kPermEditLayers | kPermLockLayers | kPermEditTimeline);
   m_peers.clear();
-  m_peers[m_localPeerId] = Peer{ m_localPeerId, m_localPerms, username.empty() ? "Host" : username };
+  m_peers[m_localPeerId] = Peer{ m_localPeerId, m_localPerms, m_localUsername };
 
-  host->server = std::make_unique<ix::WebSocketServer>(port, bindAddress);
-  host->server->disablePerMessageDeflate();
+  DirectHostConfig config;
+  config.port = port;
+  config.bindAddress = bindAddress;
+  m_transport = createDirectHostTransport(config);
 
-  host->server->setOnConnectionCallback([this](std::weak_ptr<ix::WebSocket> wsWeak,
-                                               std::shared_ptr<ix::ConnectionState> state) {
-    if (!state)
-      return;
+  setupTransportCallbacks();
 
-    uint32_t peerId = 0;
-    {
-      std::lock_guard lock(m_mutex);
-      if (!m_host)
-        return;
-      m_host->clients[peerId] = NetHost::ClientConn{ wsWeak, 0 };
-      // Do NOT add to m_peers yet. Wait for Hello.
-    }
-
-    if (auto ws = wsWeak.lock()) {
-      ws->setOnMessageCallback([this, wsWeak, peerId](const ix::WebSocketMessagePtr& msg) {
-        if (!msg)
-          return;
-
-        if (msg->type == ix::WebSocketMessageType::Open) {
-          // Wait for Hello
-          return;
-        }
-
-        if (msg->type == ix::WebSocketMessageType::Close) {
-          ui::execute_from_ui_thread([this, peerId] {
-            std::lock_guard lock(m_mutex);
-            bool wasAuth = false;
-            std::string name;
-            if (m_host) {
-              auto it = m_host->clients.find(peerId);
-              if (it != m_host->clients.end()) {
-                wasAuth = it->second.authenticated;
-                name = it->second.username;
-                m_host->clients.erase(it);
-              }
-              if (wasAuth)
-                 m_peers.erase(peerId);
-            }
-            if (wasAuth) {
-              appendChatLine(fmt::format("{} disconnected.", name.empty() ? fmt::format("Guest {}", peerId) : name));
-              updateWindow();
-            }
-          });
-          return;
-        }
-
-        if (msg->type != ix::WebSocketMessageType::Message || !msg->binary)
-          return;
-
-        Reader r(msg->str);
-        uint8_t type8 = 0;
-        if (!r.readU8(type8))
-          return;
-        const auto type = MsgType(type8);
-
-        if (type == MsgType::Hello) {
-          std::string user, pass;
-          if (!r.readString(user) || !r.readString(pass))
-            return;
-
-          ui::execute_from_ui_thread([this, wsWeak, peerId, user, pass] {
-             std::lock_guard lock(m_mutex);
-             if (!m_host) return;
-
-             // Validate Password
-             if (!m_host->password.empty() && m_host->password != pass) {
-               if (auto ws = wsWeak.lock()) {
-                 Writer w;
-                 w.writeU8(uint8_t(MsgType::Error));
-                 w.writeString("Invalid password");
-                 ws->sendBinary(toString(w.data));
-                 ws->stop(); // Close connection
-               }
-               return;
-             }
-
-             // Validate Username
-             for (const auto& [id, p] : m_peers) {
-               if (p.name == user) {
-                 if (auto ws = wsWeak.lock()) {
-                   Writer w;
-                   w.writeU8(uint8_t(MsgType::Error));
-                   w.writeString("Username taken");
-                   ws->sendBinary(toString(w.data));
-                   ws->stop();
-                 }
-                 return;
-               }
-             }
-
-             // Authenticate
-             auto it = m_host->clients.find(peerId);
-             if (it == m_host->clients.end()) return;
-
-             it->second.authenticated = true;
-             it->second.username = user;
-             m_peers[peerId] = Peer{ peerId, 0, user };
-
-             if (auto ws = wsWeak.lock()) {
-                Writer w;
-                w.writeU8(uint8_t(MsgType::Welcome));
-                w.writeU32(peerId);
-                w.writeU32(0);
-                ws->sendBinary(toString(w.data));
-
-                std::vector<uint8_t> snapshot = m_host->snapshotBytes;
-                Writer wb;
-                wb.writeU8(uint8_t(MsgType::SnapshotBegin));
-                wb.writeU32(uint32_t(snapshot.size()));
-                ws->sendBinary(toString(wb.data));
-
-                static constexpr size_t kChunkSize = 128 * 1024;
-                size_t offset = 0;
-                while (offset < snapshot.size()) {
-                  const size_t remaining = snapshot.size() - offset;
-                  const size_t n = (remaining < kChunkSize ? remaining : kChunkSize);
-                  std::vector<uint8_t> chunk(snapshot.begin() + offset, snapshot.begin() + offset + n);
-                  Writer wd;
-                  wd.writeU8(uint8_t(MsgType::SnapshotData));
-                  wd.writeBytes(chunk);
-                  ws->sendBinary(toString(wd.data));
-                  offset += n;
-                }
-
-                Writer we;
-                we.writeU8(uint8_t(MsgType::SnapshotEnd));
-                ws->sendBinary(toString(we.data));
-             }
-
-             appendChatLine(fmt::format("{} connected.", user));
-             updateWindow();
-          });
-          return;
-        }
-
-        // Require Authentication for other ops
-        {
-          std::lock_guard lock(m_mutex);
-          if (m_host) {
-            auto it = m_host->clients.find(peerId);
-            if (it == m_host->clients.end() || !it->second.authenticated)
-              return;
-          }
-        }
-
-        if (type == MsgType::OpPropose) {
-          uint32_t claimedPeerId = 0;
-          uint64_t clientOpId = 0;
-          uint8_t opType8 = 0;
-          if (!r.readU32(claimedPeerId) || !r.readU64(clientOpId) || !r.readU8(opType8))
-            return;
-          if (claimedPeerId != peerId)
-            return;
-
-          const auto opType = OpType(opType8);
-          const std::vector<uint8_t> payload(r.p, r.end);
-
-          ui::execute_from_ui_thread([this, peerId, clientOpId, opType, payload] {
-            std::lock_guard lock(m_mutex);
-            if (!m_host || !m_doc)
-              return;
-
-            // Permission check (host authoritative)
-            Permissions required = 0;
-            switch (opType) {
-              case OpType::SetPixelsRect: required = kPermEditCanvas; break;
-              case OpType::NewFrame:
-              case OpType::RemoveFrame: required = kPermEditTimeline; break;
-              case OpType::NewLayer:
-              case OpType::RemoveLayer: required = kPermEditLayers; break;
-              case OpType::LayerLock: required = kPermLockLayers; break;
-            }
-
-            auto it = m_host->clients.find(peerId);
-            if (it == m_host->clients.end())
-              return;
-            if ((it->second.perms & required) != required) {
-              Writer rej;
-              rej.writeU8(uint8_t(MsgType::OpRejected));
-              rej.writeU64(clientOpId);
-              rej.writeString("Permission denied");
-              m_host->sendTo(peerId, rej.data);
-              return;
-            }
-
-            // Decode + apply
-            const std::string payloadStr = toString(payload);
-            Reader opReader(payloadStr);
-            bool ok = true;
-            switch (opType) {
-              case OpType::SetPixelsRect: {
-                uint32_t frame = 0;
-                uint32_t pathLen = 0;
-                std::vector<uint32_t> layerPath;
-                int32_t x = 0, y = 0, w = 0, h = 0;
-                std::vector<uint8_t> bytes;
-                if (!opReader.readU32(frame) || !opReader.readU32(pathLen)) {
-                  ok = false;
-                  break;
-                }
-                if (pathLen > 64) {
-                  ok = false;
-                  break;
-                }
-                layerPath.reserve(pathLen);
-                for (uint32_t i = 0; i < pathLen; ++i) {
-                  uint32_t idx = 0;
-                  if (!opReader.readU32(idx)) {
-                    ok = false;
-                    break;
-                  }
-                  layerPath.push_back(idx);
-                }
-                if (!ok)
-                  break;
-                if (!opReader.readS32(x) || !opReader.readS32(y) || !opReader.readS32(w) ||
-                    !opReader.readS32(h) || !opReader.readBytes(bytes)) {
-                  ok = false;
-                  break;
-                }
-
-                auto* sprite = m_doc->sprite();
-                doc::Layer* layer = resolveLayerPath(sprite, layerPath);
-                if (!layer || !layer->isImage() || !layer->isEditable()) {
-                  ok = false;
-                  break;
-                }
-
-                applySetPixelsRect(doc::frame_t(frame),
-                                   layerPath,
-                                   gfx::Rect(x, y, w, h),
-                                   bytes);
-                break;
-              }
-              case OpType::NewFrame: {
-                std::string content;
-                uint32_t insertAt = 0;
-                if (!opReader.readString(content) || !opReader.readU32(insertAt)) {
-                  ok = false;
-                  break;
-                }
-                applyNewFrame(content, doc::frame_t(insertAt));
-                break;
-              }
-              case OpType::RemoveFrame: {
-                uint32_t frame = 0;
-                if (!opReader.readU32(frame)) {
-                  ok = false;
-                  break;
-                }
-                applyRemoveFrame(doc::frame_t(frame));
-                break;
-              }
-              case OpType::NewLayer: {
-                uint32_t pathLen = 0;
-                std::vector<uint32_t> afterPath;
-                std::string name;
-                if (!opReader.readU32(pathLen)) {
-                  ok = false;
-                  break;
-                }
-                if (pathLen > 64) {
-                  ok = false;
-                  break;
-                }
-                afterPath.reserve(pathLen);
-                for (uint32_t i = 0; i < pathLen; ++i) {
-                  uint32_t idx = 0;
-                  if (!opReader.readU32(idx)) {
-                    ok = false;
-                    break;
-                  }
-                  afterPath.push_back(idx);
-                }
-                if (!ok)
-                  break;
-                if (!opReader.readString(name)) {
-                  ok = false;
-                  break;
-                }
-                applyNewLayer(afterPath, name);
-                break;
-              }
-              case OpType::RemoveLayer: {
-                uint32_t pathLen = 0;
-                std::vector<uint32_t> layerPath;
-                if (!opReader.readU32(pathLen)) {
-                  ok = false;
-                  break;
-                }
-                if (pathLen > 64) {
-                  ok = false;
-                  break;
-                }
-                layerPath.reserve(pathLen);
-                for (uint32_t i = 0; i < pathLen; ++i) {
-                  uint32_t idx = 0;
-                  if (!opReader.readU32(idx)) {
-                    ok = false;
-                    break;
-                  }
-                  layerPath.push_back(idx);
-                }
-                if (!ok)
-                  break;
-                applyRemoveLayer(layerPath);
-                break;
-              }
-              case OpType::LayerLock: {
-                uint32_t pathLen = 0;
-                std::vector<uint32_t> layerPath;
-                uint8_t locked = 0;
-                if (!opReader.readU32(pathLen)) {
-                  ok = false;
-                  break;
-                }
-                if (pathLen > 64) {
-                  ok = false;
-                  break;
-                }
-                layerPath.reserve(pathLen);
-                for (uint32_t i = 0; i < pathLen; ++i) {
-                  uint32_t idx = 0;
-                  if (!opReader.readU32(idx)) {
-                    ok = false;
-                    break;
-                  }
-                  layerPath.push_back(idx);
-                }
-                if (!ok)
-                  break;
-                if (!opReader.readU8(locked)) {
-                  ok = false;
-                  break;
-                }
-                applyLayerLock(layerPath, locked != 0);
-                break;
-              }
-            }
-
-            if (!ok) {
-              Writer rej;
-              rej.writeU8(uint8_t(MsgType::OpRejected));
-              rej.writeU64(clientOpId);
-              rej.writeString("Invalid operation");
-              m_host->sendTo(peerId, rej.data);
-              return;
-            }
-
-            // Broadcast accepted op
-            Writer w;
-            w.writeU8(uint8_t(MsgType::Op));
-            w.writeU64(m_nextRev++);
-            w.writeU32(peerId);
-            w.writeU8(uint8_t(opType));
-            w.data.insert(w.data.end(), payload.begin(), payload.end());
-            m_host->broadcast(w.data);
-          });
-        }
-        else if (type == MsgType::ChatSend) {
-          uint32_t claimedPeerId = 0;
-          std::string text;
-          if (!r.readU32(claimedPeerId) || !r.readString(text))
-            return;
-          if (claimedPeerId != peerId)
-            return;
-
-          ui::execute_from_ui_thread([this, peerId, text] {
-            std::lock_guard lock(m_mutex);
-            if (!m_host)
-              return;
-            Writer w;
-            w.writeU8(uint8_t(MsgType::ChatBroadcast));
-            w.writeU32(peerId);
-            w.writeString(text);
-            m_host->broadcast(w.data);
-            appendChatLine(fmt::format("[{}] {}", peerId, text));
-            updateWindow();
-          });
-        }
-        else if (type == MsgType::CursorPosition) {
-          uint32_t claimedPeerId = 0;
-          int32_t x = 0, y = 0;
-          if (!r.readU32(claimedPeerId) || !r.readS32(x) || !r.readS32(y))
-            return;
-          if (claimedPeerId != peerId)
-            return;
-
-          ui::execute_from_ui_thread([this, peerId, x, y] {
-            std::lock_guard lock(m_mutex);
-            if (!m_host)
-              return;
-
-            // Validate peer has canvas edit permission
-            auto clientIt = m_host->clients.find(peerId);
-            if (clientIt == m_host->clients.end())
-              return;
-            if ((clientIt->second.perms & kPermEditCanvas) == 0)
-              return;
-
-            // Update stored cursor position
-            auto peerIt = m_peers.find(peerId);
-            if (peerIt != m_peers.end()) {
-              peerIt->second.cursorPos = gfx::Point(x, y);
-              peerIt->second.cursorVisible = true;
-            }
-
-            // Broadcast to all clients (including sender so they know it was accepted)
-            Writer w;
-            w.writeU8(uint8_t(MsgType::CursorPosition));
-            w.writeU32(peerId);
-            w.writeS32(x);
-            w.writeS32(y);
-            m_host->broadcast(w.data);
-          });
-        }
-        else if (type == MsgType::CursorHide) {
-          uint32_t claimedPeerId = 0;
-          if (!r.readU32(claimedPeerId))
-            return;
-          if (claimedPeerId != peerId)
-            return;
-
-          ui::execute_from_ui_thread([this, peerId] {
-            std::lock_guard lock(m_mutex);
-            if (!m_host)
-              return;
-
-            // Update stored cursor visibility
-            auto peerIt = m_peers.find(peerId);
-            if (peerIt != m_peers.end()) {
-              peerIt->second.cursorVisible = false;
-            }
-
-            // Broadcast to all clients
-            Writer w;
-            w.writeU8(uint8_t(MsgType::CursorHide));
-            w.writeU32(peerId);
-            m_host->broadcast(w.data);
-          });
-        }
-      });
-    }
-  });
-
-  m_host = std::move(host);
-
-  if (!m_host->server->listenAndStart()) {
+  if (!m_transport->start()) {
     ui::Alert::show("Failed to start server.");
     stopNoLock();
     return false;
   }
+
   appendChatLine(fmt::format("Hosting on {}:{}", bindAddress, port));
   updateWindow();
   return true;
@@ -854,333 +1246,27 @@ bool OnlineSessionManager::join(Context* ctx, const std::string& address, int po
   stopNoLock();
 
   m_role = Role::Guest;
+  m_connType = ConnectionType::Direct;
+  m_ctx = ctx;
   m_doc = nullptr;
+  m_localUsername = username;
+  m_password = password;
   m_localPeerId = 0;
   m_localPerms = 0;
   m_peers.clear();
 
-  auto client = std::make_unique<NetClient>();
-  client->ws = std::make_unique<ix::WebSocket>();
-  client->ws->disablePerMessageDeflate();
-  client->ws->disableAutomaticReconnection();
-  client->url = fmt::format("ws://{}:{}/", address, port);
-  client->ws->setUrl(client->url);
+  DirectClientConfig config;
+  config.address = address;
+  config.port = port;
+  m_transport = createDirectClientTransport(config);
 
-  client->username = username;
-  client->password = password;
-
-  client->ws->setOnMessageCallback([this, ctx](const ix::WebSocketMessagePtr& msg) {
-    if (!msg)
-      return;
-
-    if (msg->type == ix::WebSocketMessageType::Open) {
-      ui::execute_from_ui_thread([this] {
-        std::lock_guard lock(m_mutex);
-        if (!m_client) return;
-        
-        appendChatLine("Socket connected. Sending credentials...");
-        updateWindow();
-
-        Writer w;
-        w.writeU8(uint8_t(MsgType::Hello));
-        w.writeString(m_client->username);
-        w.writeString(m_client->password);
-        m_client->ws->sendBinary(toString(w.data));
-      });
-      return;
-    }
-    if (msg->type == ix::WebSocketMessageType::Error) {
-      const std::string reason = msg->errorInfo.reason;
-      ui::execute_from_ui_thread([this, reason] {
-        std::lock_guard lock(m_mutex);
-        appendChatLine(fmt::format("Connection error: {}", reason));
-        updateWindow();
-      });
-      return;
-    }
-    if (msg->type == ix::WebSocketMessageType::Close) {
-      ui::execute_from_ui_thread([this] {
-        std::lock_guard lock(m_mutex);
-        appendChatLine("Connection closed.");
-        updateWindow();
-      });
-      return;
-    }
-
-    if (msg->type != ix::WebSocketMessageType::Message || !msg->binary)
-      return;
-
-    Reader r(msg->str);
-    uint8_t type8 = 0;
-    if (!r.readU8(type8))
-      return;
-
-    const auto type = MsgType(type8);
-    switch (type) {
-      case MsgType::Error: {
-        std::string text;
-        if (r.readString(text)) {
-          ui::execute_from_ui_thread([text] {
-            ui::Alert::show(fmt::format("Connection Error<<{}", text));
-          });
-        }
-        break;
-      }
-      case MsgType::Welcome: {
-        uint32_t peerId = 0;
-        uint32_t perms = 0;
-        if (!r.readU32(peerId) || !r.readU32(perms))
-          return;
-        ui::execute_from_ui_thread([this, peerId, perms] { onWelcome(peerId, perms); });
-        break;
-      }
-      case MsgType::SnapshotBegin: {
-        uint32_t sizeBytes = 0;
-        if (!r.readU32(sizeBytes))
-          return;
-        ui::execute_from_ui_thread([this, sizeBytes] { onSnapshotBegin(sizeBytes); });
-        break;
-      }
-      case MsgType::SnapshotData: {
-        std::vector<uint8_t> chunk;
-        if (!r.readBytes(chunk))
-          return;
-        ui::execute_from_ui_thread([this, chunk = std::move(chunk)] { onSnapshotData(chunk); });
-        break;
-      }
-      case MsgType::SnapshotEnd: {
-        ui::execute_from_ui_thread([this, ctx] { onSnapshotEnd(ctx); });
-        break;
-      }
-      case MsgType::Op: {
-        uint64_t rev = 0;
-        uint32_t authorPeerId = 0;
-        uint8_t opType8 = 0;
-        if (!r.readU64(rev) || !r.readU32(authorPeerId) || !r.readU8(opType8))
-          return;
-        const auto opType = OpType(opType8);
-        const std::vector<uint8_t> payload(r.p, r.end);
-        ui::execute_from_ui_thread([this, rev, authorPeerId, opType, payload] {
-          if (!m_doc)
-            return;
-          if (base::get_log_level() >= VERBOSE) {
-            LOG(VERBOSE,
-                "ONLINE: recv Op: rev=%u author=%u type=%u payload=%u\n",
-                unsigned(rev),
-                unsigned(authorPeerId),
-                unsigned(opType),
-                unsigned(payload.size()));
-          }
-          const std::string payloadStr = toString(payload);
-          Reader opReader(payloadStr);
-          switch (opType) {
-            case OpType::SetPixelsRect: {
-              uint32_t frame = 0;
-              uint32_t pathLen = 0;
-              std::vector<uint32_t> layerPath;
-              int32_t x = 0, y = 0, w = 0, h = 0;
-              std::vector<uint8_t> bytes;
-              if (!opReader.readU32(frame) || !opReader.readU32(pathLen)) {
-                LOG(WARNING, "ONLINE: decode SetPixelsRect failed (rev=%u) header\n", unsigned(rev));
-                return;
-              }
-              if (pathLen > 64) {
-                LOG(WARNING,
-                    "ONLINE: decode SetPixelsRect failed (rev=%u) bad pathLen=%u\n",
-                    unsigned(rev),
-                    unsigned(pathLen));
-                return;
-              }
-              layerPath.reserve(pathLen);
-              for (uint32_t i = 0; i < pathLen; ++i) {
-                uint32_t idx = 0;
-                if (!opReader.readU32(idx)) {
-                  LOG(WARNING,
-                      "ONLINE: decode SetPixelsRect failed (rev=%u) layerPath[%u]\n",
-                      unsigned(rev),
-                      unsigned(i));
-                  return;
-                }
-                layerPath.push_back(idx);
-              }
-              if (!opReader.readS32(x) || !opReader.readS32(y) || !opReader.readS32(w) ||
-                  !opReader.readS32(h)) {
-                LOG(WARNING, "ONLINE: decode SetPixelsRect failed (rev=%u) rect\n", unsigned(rev));
-                return;
-              }
-              uint32_t nBytes = 0;
-              if (!opReader.readU32(nBytes)) {
-                LOG(WARNING,
-                    "ONLINE: decode SetPixelsRect failed (rev=%u) bytesLen\n",
-                    unsigned(rev));
-                return;
-              }
-              if (!opReader.ok(nBytes)) {
-                const size_t remaining = size_t(opReader.end - opReader.p);
-                LOG(WARNING,
-                    "ONLINE: decode SetPixelsRect failed (rev=%u) bytes (need=%u remaining=%u rect=%dx%d)\n",
-                    unsigned(rev),
-                    unsigned(nBytes),
-                    unsigned(remaining),
-                    int(w),
-                    int(h));
-                return;
-              }
-              bytes.assign(opReader.p, opReader.p + nBytes);
-              opReader.p += nBytes;
-              applySetPixelsRect(doc::frame_t(frame),
-                                 layerPath,
-                                 gfx::Rect(x, y, w, h),
-                                  bytes);
-              break;
-            }
-            case OpType::NewFrame: {
-              std::string content;
-              uint32_t insertAt = 0;
-              if (!opReader.readString(content) || !opReader.readU32(insertAt))
-                return;
-              applyNewFrame(content, doc::frame_t(insertAt));
-              break;
-            }
-            case OpType::RemoveFrame: {
-              uint32_t frame = 0;
-              if (!opReader.readU32(frame))
-                return;
-              applyRemoveFrame(doc::frame_t(frame));
-              break;
-            }
-            case OpType::NewLayer: {
-              uint32_t pathLen = 0;
-              std::vector<uint32_t> afterPath;
-              std::string name;
-              if (!opReader.readU32(pathLen))
-                return;
-              if (pathLen > 64)
-                return;
-              afterPath.reserve(pathLen);
-              for (uint32_t i = 0; i < pathLen; ++i) {
-                uint32_t idx = 0;
-                if (!opReader.readU32(idx))
-                  return;
-                afterPath.push_back(idx);
-              }
-              if (!opReader.readString(name))
-                return;
-              applyNewLayer(afterPath, name);
-              break;
-            }
-            case OpType::RemoveLayer: {
-              uint32_t pathLen = 0;
-              std::vector<uint32_t> layerPath;
-              if (!opReader.readU32(pathLen))
-                return;
-              if (pathLen > 64)
-                return;
-              layerPath.reserve(pathLen);
-              for (uint32_t i = 0; i < pathLen; ++i) {
-                uint32_t idx = 0;
-                if (!opReader.readU32(idx))
-                  return;
-                layerPath.push_back(idx);
-              }
-              applyRemoveLayer(layerPath);
-              break;
-            }
-            case OpType::LayerLock: {
-              uint32_t pathLen = 0;
-              std::vector<uint32_t> layerPath;
-              uint8_t locked = 0;
-              if (!opReader.readU32(pathLen))
-                return;
-              if (pathLen > 64)
-                return;
-              layerPath.reserve(pathLen);
-              for (uint32_t i = 0; i < pathLen; ++i) {
-                uint32_t idx = 0;
-                if (!opReader.readU32(idx))
-                  return;
-                layerPath.push_back(idx);
-              }
-              if (!opReader.readU8(locked))
-                return;
-              applyLayerLock(layerPath, locked != 0);
-              break;
-            }
-          }
-        });
-        break;
-      }
-      case MsgType::PermissionsSet: {
-        uint32_t peerId = 0;
-        uint32_t perms = 0;
-        if (!r.readU32(peerId) || !r.readU32(perms))
-          return;
-        ui::execute_from_ui_thread([this, peerId, perms] { onPermissionsSet(peerId, perms); });
-        break;
-      }
-      case MsgType::Kick: {
-        std::string reason;
-        r.readString(reason);
-        ui::execute_from_ui_thread([this, reason] { onKick(reason); });
-        break;
-      }
-      case MsgType::ChatBroadcast: {
-        uint32_t peerId = 0;
-        std::string text;
-        if (!r.readU32(peerId) || !r.readString(text))
-          return;
-        ui::execute_from_ui_thread([this, peerId, text] { onChatBroadcast(peerId, text); });
-        break;
-      }
-      case MsgType::CursorPosition: {
-        uint32_t peerId = 0;
-        int32_t x = 0, y = 0;
-        if (!r.readU32(peerId) || !r.readS32(x) || !r.readS32(y))
-          return;
-        ui::execute_from_ui_thread([this, peerId, x, y] {
-          std::lock_guard lock(m_mutex);
-          auto it = m_peers.find(peerId);
-          if (it != m_peers.end()) {
-            it->second.cursorPos = gfx::Point(x, y);
-            it->second.cursorVisible = true;
-          }
-        });
-        break;
-      }
-      case MsgType::CursorHide: {
-        uint32_t peerId = 0;
-        if (!r.readU32(peerId))
-          return;
-        ui::execute_from_ui_thread([this, peerId] {
-          std::lock_guard lock(m_mutex);
-          auto it = m_peers.find(peerId);
-          if (it != m_peers.end()) {
-            it->second.cursorVisible = false;
-          }
-        });
-        break;
-      }
-      default: break;
-    }
-  });
-
-  client->ws->start();
-  m_client = std::move(client);
+  setupTransportCallbacks();
+  m_transport->start();
 
   appendChatLine(fmt::format("Connecting to {}:{}", address, port));
   updateWindow();
   return true;
 }
-
-void OnlineSessionManager::leave()
-{
-  std::lock_guard lock(m_mutex);
-  stopNoLock();
-  updateWindow();
-}
-
-// PartyKit relay host URL (configurable via environment or build option)
-static constexpr const char* kPartyKitHost = "aseprite-relay.trivaxy.partykit.dev";
 
 bool OnlineSessionManager::startHostPartyKit(Context* ctx, Doc* doc, const std::string& roomName, const std::string& username, const std::string& password)
 {
@@ -1197,207 +1283,32 @@ bool OnlineSessionManager::startHostPartyKit(Context* ctx, Doc* doc, const std::
   std::lock_guard lock(m_mutex);
   stopNoLock();
 
-  auto host = std::make_unique<NetHost>();
-  host->snapshotBytes = buildSnapshotBytes(doc);
-  if (host->snapshotBytes.empty()) {
+  m_snapshotBytes = buildSnapshotBytes(doc);
+  if (m_snapshotBytes.empty()) {
     ui::Alert::show("Failed to build snapshot.");
     stopNoLock();
     return false;
   }
 
-  host->password = password;
-
   m_role = Role::Host;
   m_connType = ConnectionType::PartyKit;
   m_doc = doc;
+  m_ctx = ctx;
   m_roomName = roomName;
+  m_localUsername = username.empty() ? "Host" : username;
+  m_password = password;
   m_localPeerId = 1;
   m_localPerms = (kPermEditCanvas | kPermEditLayers | kPermLockLayers | kPermEditTimeline);
   m_peers.clear();
-  m_peers[m_localPeerId] = Peer{ m_localPeerId, m_localPerms, username.empty() ? "Host" : username };
+  m_peers[m_localPeerId] = Peer{ m_localPeerId, m_localPerms, m_localUsername };
 
-  // For PartyKit hosting, we connect as a client to the relay
-  // The relay will treat this connection as the "host" because of the ?host=true query param
-  auto client = std::make_unique<NetClient>();
-  client->ws = std::make_unique<ix::WebSocket>();
-  client->ws->disablePerMessageDeflate();
-  client->ws->disableAutomaticReconnection();
-  client->url = fmt::format("wss://{}/party/main/{}?host=true", kPartyKitHost, roomName);
-  LOG(INFO, "PARTYKIT HOST: Connecting to URL: %s\n", client->url.c_str());
-  client->ws->setUrl(client->url);
-  client->username = username;
-  client->password = password;
+  PartyKitConfig config;
+  config.roomName = roomName;
+  config.isHost = true;
+  m_transport = createPartyKitTransport(config);
 
-  m_host = std::move(host);
-
-  // Track whether we've received the relay's OK response
-  auto relayConfirmed = std::make_shared<bool>(false);
-
-  client->ws->setOnMessageCallback([this, ctx, relayConfirmed](const ix::WebSocketMessagePtr& msg) {
-    if (!msg)
-      return;
-
-    if (msg->type == ix::WebSocketMessageType::Open) {
-      LOG(INFO, "PARTYKIT HOST: WebSocket connection opened\n");
-      ui::execute_from_ui_thread([this] {
-        std::lock_guard lock(m_mutex);
-        appendChatLine("Connected to PartyKit relay...");
-        updateWindow();
-      });
-      return;
-    }
-
-    if (msg->type == ix::WebSocketMessageType::Error) {
-      const std::string reason = msg->errorInfo.reason;
-      ui::execute_from_ui_thread([this, reason] {
-        std::lock_guard lock(m_mutex);
-        appendChatLine(fmt::format("Connection error: {}", reason));
-        updateWindow();
-      });
-      return;
-    }
-
-    if (msg->type == ix::WebSocketMessageType::Close) {
-      ui::execute_from_ui_thread([this] {
-        std::lock_guard lock(m_mutex);
-        appendChatLine("Connection closed.");
-        updateWindow();
-      });
-      return;
-    }
-
-    if (msg->type != ix::WebSocketMessageType::Message)
-      return;
-
-    LOG(INFO, "PARTYKIT HOST: Received message, binary=%d, size=%zu\n", msg->binary ? 1 : 0, msg->str.size());
-    if (!msg->binary) {
-      LOG(INFO, "PARTYKIT HOST: Text message: %s\n", msg->str.c_str());
-    }
-
-    // Check for relay JSON responses first (before relay is confirmed)
-    if (!*relayConfirmed && !msg->binary) {
-      const std::string& text = msg->str;
-      // Simple JSON parsing for relay responses
-      if (text.find("\"type\":\"host_ok\"") != std::string::npos ||
-          text.find("\"type\": \"host_ok\"") != std::string::npos) {
-        *relayConfirmed = true;
-        LOG(INFO, "PARTYKIT HOST: Relay confirmed host_ok\n");
-        ui::execute_from_ui_thread([this] {
-          std::lock_guard lock(m_mutex);
-          appendChatLine(fmt::format("Hosting room '{}'", m_roomName));
-          updateWindow();
-        });
-        return;
-      }
-      if (text.find("\"type\":\"error\"") != std::string::npos ||
-          text.find("\"type\": \"error\"") != std::string::npos) {
-        // Extract error message
-        std::string errMsg = "Room already exists";
-        auto msgPos = text.find("\"message\"");
-        if (msgPos != std::string::npos) {
-          auto colonPos = text.find(':', msgPos);
-          auto quoteStart = text.find('"', colonPos);
-          auto quoteEnd = text.find('"', quoteStart + 1);
-          if (quoteStart != std::string::npos && quoteEnd != std::string::npos) {
-            errMsg = text.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
-          }
-        }
-        ui::execute_from_ui_thread([this, errMsg] {
-          std::lock_guard lock(m_mutex);
-          ui::Alert::show(fmt::format("PartyKit Error<<{}", errMsg));
-          stopNoLock();
-          updateWindow();
-        });
-        return;
-      }
-    }
-
-    // After relay is confirmed, handle binary messages from guests
-    if (!msg->binary)
-      return;
-
-    // Handle guest messages (similar to direct host logic)
-    Reader r(msg->str);
-    uint8_t type8 = 0;
-    if (!r.readU8(type8))
-      return;
-    const auto type = MsgType(type8);
-    LOG(INFO, "PARTYKIT HOST: Received binary message type=%u\n", unsigned(type8));
-
-    if (type == MsgType::Hello) {
-      std::string user, pass;
-      if (!r.readString(user) || !r.readString(pass))
-        return;
-
-      ui::execute_from_ui_thread([this, user, pass] {
-        std::lock_guard lock(m_mutex);
-        if (!m_host || !m_client) return;
-        LOG(INFO, "PARTYKIT HOST: Received Hello from user='%s'\n", user.c_str());
-
-        // Validate Password
-        if (!m_host->password.empty() && m_host->password != pass) {
-          Writer w;
-          w.writeU8(uint8_t(MsgType::Error));
-          w.writeString("Invalid password");
-          m_client->ws->sendBinary(toString(w.data));
-          return;
-        }
-
-        // Validate Username
-        for (const auto& [id, p] : m_peers) {
-          if (p.name == user) {
-            Writer w;
-            w.writeU8(uint8_t(MsgType::Error));
-            w.writeString("Username taken");
-            m_client->ws->sendBinary(toString(w.data));
-            return;
-          }
-        }
-
-        // Assign peer ID and add to peers
-        uint32_t peerId = m_host->nextPeerId++;
-        m_peers[peerId] = Peer{ peerId, 0, user };
-
-        // Send Welcome
-        Writer w;
-        w.writeU8(uint8_t(MsgType::Welcome));
-        w.writeU32(peerId);
-        w.writeU32(0);
-        m_client->ws->sendBinary(toString(w.data));
-
-        // Send snapshot
-        std::vector<uint8_t> snapshot = m_host->snapshotBytes;
-        Writer wb;
-        wb.writeU8(uint8_t(MsgType::SnapshotBegin));
-        wb.writeU32(uint32_t(snapshot.size()));
-        m_client->ws->sendBinary(toString(wb.data));
-
-        static constexpr size_t kChunkSize = 128 * 1024;
-        size_t offset = 0;
-        while (offset < snapshot.size()) {
-          const size_t remaining = snapshot.size() - offset;
-          const size_t n = (remaining < kChunkSize ? remaining : kChunkSize);
-          std::vector<uint8_t> chunk(snapshot.begin() + offset, snapshot.begin() + offset + n);
-          Writer wd;
-          wd.writeU8(uint8_t(MsgType::SnapshotData));
-          wd.writeBytes(chunk);
-          m_client->ws->sendBinary(toString(wd.data));
-          offset += n;
-        }
-
-        Writer we;
-        we.writeU8(uint8_t(MsgType::SnapshotEnd));
-        m_client->ws->sendBinary(toString(we.data));
-
-        appendChatLine(fmt::format("{} connected.", user));
-        updateWindow();
-      });
-    }
-    // TODO: Handle other message types from guests via PartyKit relay
-  });
-
-  client->ws->start();
-  m_client = std::move(client);
+  setupTransportCallbacks();
+  m_transport->start();
 
   appendChatLine(fmt::format("Connecting to room '{}'...", roomName));
   updateWindow();
@@ -1421,329 +1332,38 @@ bool OnlineSessionManager::joinPartyKit(Context* ctx, const std::string& roomNam
 
   m_role = Role::Guest;
   m_connType = ConnectionType::PartyKit;
+  m_ctx = ctx;
   m_roomName = roomName;
   m_doc = nullptr;
+  m_localUsername = username;
+  m_password = password;
   m_localPeerId = 0;
   m_localPerms = 0;
   m_peers.clear();
 
-  auto client = std::make_unique<NetClient>();
-  client->ws = std::make_unique<ix::WebSocket>();
-  client->ws->disablePerMessageDeflate();
-  client->ws->disableAutomaticReconnection();
-  client->url = fmt::format("wss://{}/party/main/{}", kPartyKitHost, roomName);
-  LOG(INFO, "PARTYKIT GUEST: Connecting to URL: %s\n", client->url.c_str());
-  client->ws->setUrl(client->url);
+  PartyKitConfig config;
+  config.roomName = roomName;
+  config.isHost = false;
+  m_transport = createPartyKitTransport(config);
 
-  client->username = username;
-  client->password = password;
-
-  // Track whether we've received the relay's OK response
-  auto relayConfirmed = std::make_shared<bool>(false);
-
-  client->ws->setOnMessageCallback([this, ctx, relayConfirmed](const ix::WebSocketMessagePtr& msg) {
-    if (!msg)
-      return;
-
-    if (msg->type == ix::WebSocketMessageType::Open) {
-      LOG(INFO, "PARTYKIT GUEST: WebSocket connection opened\n");
-      ui::execute_from_ui_thread([this] {
-        std::lock_guard lock(m_mutex);
-        appendChatLine("Connected to PartyKit relay...");
-        updateWindow();
-      });
-      return;
-    }
-
-    if (msg->type == ix::WebSocketMessageType::Error) {
-      const std::string reason = msg->errorInfo.reason;
-      ui::execute_from_ui_thread([this, reason] {
-        std::lock_guard lock(m_mutex);
-        appendChatLine(fmt::format("Connection error: {}", reason));
-        updateWindow();
-      });
-      return;
-    }
-
-    if (msg->type == ix::WebSocketMessageType::Close) {
-      ui::execute_from_ui_thread([this] {
-        std::lock_guard lock(m_mutex);
-        appendChatLine("Connection closed.");
-        updateWindow();
-      });
-      return;
-    }
-
-    if (msg->type != ix::WebSocketMessageType::Message)
-      return;
-
-    LOG(INFO, "PARTYKIT GUEST: Received message, binary=%d, size=%zu\n", msg->binary ? 1 : 0, msg->str.size());
-    if (!msg->binary) {
-      LOG(INFO, "PARTYKIT GUEST: Text message: %s\n", msg->str.c_str());
-    }
-
-    // Check for relay JSON responses first (before relay is confirmed)
-    if (!*relayConfirmed && !msg->binary) {
-      const std::string& text = msg->str;
-      // Simple JSON parsing for relay responses
-      if (text.find("\"type\":\"guest_ok\"") != std::string::npos ||
-          text.find("\"type\": \"guest_ok\"") != std::string::npos) {
-        *relayConfirmed = true;
-        LOG(INFO, "PARTYKIT GUEST: Relay confirmed guest_ok, sending Hello\n");
-        ui::execute_from_ui_thread([this] {
-          std::lock_guard lock(m_mutex);
-          if (!m_client) return;
-
-          appendChatLine("Room found. Sending credentials...");
-          updateWindow();
-
-          // Send Hello to host (via relay)
-          Writer w;
-          w.writeU8(uint8_t(MsgType::Hello));
-          w.writeString(m_client->username);
-          w.writeString(m_client->password);
-          LOG(INFO, "PARTYKIT GUEST: Sending Hello with username='%s'\n", m_client->username.c_str());
-          m_client->ws->sendBinary(toString(w.data));
-        });
-        return;
-      }
-      if (text.find("\"type\":\"error\"") != std::string::npos ||
-          text.find("\"type\": \"error\"") != std::string::npos) {
-        // Extract error message
-        std::string errMsg = "Room not found";
-        auto msgPos = text.find("\"message\"");
-        if (msgPos != std::string::npos) {
-          auto colonPos = text.find(':', msgPos);
-          auto quoteStart = text.find('"', colonPos);
-          auto quoteEnd = text.find('"', quoteStart + 1);
-          if (quoteStart != std::string::npos && quoteEnd != std::string::npos) {
-            errMsg = text.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
-          }
-        }
-        ui::execute_from_ui_thread([this, errMsg] {
-          std::lock_guard lock(m_mutex);
-          ui::Alert::show(fmt::format("PartyKit Error<<{}", errMsg));
-          stopNoLock();
-          updateWindow();
-        });
-        return;
-      }
-      if (text.find("\"type\":\"host_disconnected\"") != std::string::npos ||
-          text.find("\"type\": \"host_disconnected\"") != std::string::npos) {
-        ui::execute_from_ui_thread([this] {
-          std::lock_guard lock(m_mutex);
-          ui::Alert::show("Host disconnected");
-          stopNoLock();
-          updateWindow();
-        });
-        return;
-      }
-    }
-
-    // After relay is confirmed, handle binary messages from host
-    if (!msg->binary)
-      return;
-
-    Reader r(msg->str);
-    uint8_t type8 = 0;
-    if (!r.readU8(type8))
-      return;
-
-    const auto type = MsgType(type8);
-    switch (type) {
-      case MsgType::Error: {
-        std::string text;
-        if (r.readString(text)) {
-          ui::execute_from_ui_thread([text] {
-            ui::Alert::show(fmt::format("Connection Error<<{}", text));
-          });
-        }
-        break;
-      }
-      case MsgType::Welcome: {
-        uint32_t peerId = 0;
-        uint32_t perms = 0;
-        if (!r.readU32(peerId) || !r.readU32(perms))
-          return;
-        ui::execute_from_ui_thread([this, peerId, perms] { onWelcome(peerId, perms); });
-        break;
-      }
-      case MsgType::SnapshotBegin: {
-        uint32_t sizeBytes = 0;
-        if (!r.readU32(sizeBytes))
-          return;
-        ui::execute_from_ui_thread([this, sizeBytes] { onSnapshotBegin(sizeBytes); });
-        break;
-      }
-      case MsgType::SnapshotData: {
-        std::vector<uint8_t> chunk;
-        if (!r.readBytes(chunk))
-          return;
-        ui::execute_from_ui_thread([this, chunk = std::move(chunk)] { onSnapshotData(chunk); });
-        break;
-      }
-      case MsgType::SnapshotEnd: {
-        ui::execute_from_ui_thread([this, ctx] { onSnapshotEnd(ctx); });
-        break;
-      }
-      case MsgType::PermissionsSet: {
-        uint32_t peerId = 0;
-        uint32_t perms = 0;
-        if (!r.readU32(peerId) || !r.readU32(perms))
-          return;
-        ui::execute_from_ui_thread([this, peerId, perms] { onPermissionsSet(peerId, perms); });
-        break;
-      }
-      case MsgType::Kick: {
-        std::string reason;
-        r.readString(reason);
-        ui::execute_from_ui_thread([this, reason] { onKick(reason); });
-        break;
-      }
-      case MsgType::ChatBroadcast: {
-        uint32_t peerId = 0;
-        std::string text;
-        if (!r.readU32(peerId) || !r.readString(text))
-          return;
-        ui::execute_from_ui_thread([this, peerId, text] { onChatBroadcast(peerId, text); });
-        break;
-      }
-      case MsgType::Op: {
-        uint64_t rev = 0;
-        uint32_t authorPeerId = 0;
-        uint8_t opType8 = 0;
-        if (!r.readU64(rev) || !r.readU32(authorPeerId) || !r.readU8(opType8))
-          return;
-        const auto opType = OpType(opType8);
-        const std::vector<uint8_t> payload(r.p, r.end);
-        LOG(INFO, "PARTYKIT GUEST: Received Op rev=%u author=%u type=%u payload=%u\n",
-            unsigned(rev), unsigned(authorPeerId), unsigned(opType8), unsigned(payload.size()));
-        ui::execute_from_ui_thread([this, rev, authorPeerId, opType, payload] {
-          if (!m_doc)
-            return;
-          const std::string payloadStr = toString(payload);
-          Reader opReader(payloadStr);
-          switch (opType) {
-            case OpType::SetPixelsRect: {
-              uint32_t frame = 0;
-              uint32_t pathLen = 0;
-              std::vector<uint32_t> layerPath;
-              int32_t x = 0, y = 0, w = 0, h = 0;
-              std::vector<uint8_t> bytes;
-              if (!opReader.readU32(frame) || !opReader.readU32(pathLen))
-                return;
-              if (pathLen > 64)
-                return;
-              layerPath.reserve(pathLen);
-              for (uint32_t i = 0; i < pathLen; ++i) {
-                uint32_t idx = 0;
-                if (!opReader.readU32(idx))
-                  return;
-                layerPath.push_back(idx);
-              }
-              if (!opReader.readS32(x) || !opReader.readS32(y) || !opReader.readS32(w) ||
-                  !opReader.readS32(h))
-                return;
-              uint32_t nBytes = 0;
-              if (!opReader.readU32(nBytes))
-                return;
-              if (!opReader.ok(nBytes))
-                return;
-              bytes.assign(opReader.p, opReader.p + nBytes);
-              opReader.p += nBytes;
-              LOG(INFO, "PARTYKIT GUEST: Applying SetPixelsRect frame=%u rect=(%d,%d %dx%d)\n",
-                  unsigned(frame), x, y, w, h);
-              applySetPixelsRect(doc::frame_t(frame), layerPath, gfx::Rect(x, y, w, h), bytes);
-              break;
-            }
-            case OpType::NewFrame: {
-              std::string content;
-              uint32_t insertAt = 0;
-              if (!opReader.readString(content) || !opReader.readU32(insertAt))
-                return;
-              applyNewFrame(content, doc::frame_t(insertAt));
-              break;
-            }
-            case OpType::RemoveFrame: {
-              uint32_t frame = 0;
-              if (!opReader.readU32(frame))
-                return;
-              applyRemoveFrame(doc::frame_t(frame));
-              break;
-            }
-            case OpType::NewLayer: {
-              uint32_t pathLen = 0;
-              std::vector<uint32_t> afterPath;
-              std::string name;
-              if (!opReader.readU32(pathLen))
-                return;
-              if (pathLen > 64)
-                return;
-              afterPath.reserve(pathLen);
-              for (uint32_t i = 0; i < pathLen; ++i) {
-                uint32_t idx = 0;
-                if (!opReader.readU32(idx))
-                  return;
-                afterPath.push_back(idx);
-              }
-              if (!opReader.readString(name))
-                return;
-              applyNewLayer(afterPath, name);
-              break;
-            }
-            case OpType::RemoveLayer: {
-              uint32_t pathLen = 0;
-              std::vector<uint32_t> layerPath;
-              if (!opReader.readU32(pathLen))
-                return;
-              if (pathLen > 64)
-                return;
-              layerPath.reserve(pathLen);
-              for (uint32_t i = 0; i < pathLen; ++i) {
-                uint32_t idx = 0;
-                if (!opReader.readU32(idx))
-                  return;
-                layerPath.push_back(idx);
-              }
-              applyRemoveLayer(layerPath);
-              break;
-            }
-            case OpType::LayerLock: {
-              uint32_t pathLen = 0;
-              std::vector<uint32_t> layerPath;
-              uint8_t locked = 0;
-              if (!opReader.readU32(pathLen))
-                return;
-              if (pathLen > 64)
-                return;
-              layerPath.reserve(pathLen);
-              for (uint32_t i = 0; i < pathLen; ++i) {
-                uint32_t idx = 0;
-                if (!opReader.readU32(idx))
-                  return;
-                layerPath.push_back(idx);
-              }
-              if (!opReader.readU8(locked))
-                return;
-              applyLayerLock(layerPath, locked != 0);
-              break;
-            }
-          }
-        });
-        break;
-      }
-      default: break;
-    }
-  });
-
-  client->ws->start();
-  m_client = std::move(client);
+  setupTransportCallbacks();
+  m_transport->start();
 
   appendChatLine(fmt::format("Connecting to room '{}'...", roomName));
   updateWindow();
   return true;
 }
 
+void OnlineSessionManager::leave()
+{
+  std::lock_guard lock(m_mutex);
+  stopNoLock();
+  updateWindow();
+}
+
+//------------------------------------------------------------------------------
+// Paint stroke syncing
+//------------------------------------------------------------------------------
 
 void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
                                                   const gfx::Region& dirtyArea)
@@ -1769,14 +1389,7 @@ void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
   if (!buildLayerPath(layer, layerPath))
     return;
 
-  // Send a single bounding-rect patch for the whole stroke. This is
-  // heavier than sending each region-rect, but avoids cases where a
-  // long/fast stroke (e.g. eraser) would appear partially applied if
-  // any sub-rect message fails to send.
   gfx::Rect spriteRc = dirtyArea.bounds();
-  // Expand a bit to avoid missing a couple of edge pixels (some
-  // tools/brushes can end up modifying 1px outside the computed dirty
-  // region bounds depending on brush shape and rounding).
   static constexpr int kStrokeMargin = 4;
   spriteRc = spriteRc.enlarge(kStrokeMargin);
   auto* spr = toolLoop->sprite();
@@ -1786,39 +1399,10 @@ void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
   if (spriteRc.isEmpty())
     return;
 
-  if (base::get_log_level() >= VERBOSE) {
-    LOG(VERBOSE,
-        "ONLINE: onPaintStrokeCommitted: role=%d inkEraser=%d dirty=(%d,%d %dx%d) sendRc=(%d,%d %dx%d)\n",
-        int(m_role),
-        int(toolLoop->getInk()->isEraser()),
-        dirtyArea.bounds().x,
-        dirtyArea.bounds().y,
-        dirtyArea.bounds().w,
-        dirtyArea.bounds().h,
-        spriteRc.x,
-        spriteRc.y,
-        spriteRc.w,
-        spriteRc.h);
-  }
-
-  // Read pixels from the committed cel image (not ToolLoop::getDstImage()).
-  // Some paint interactions (e.g. a tap) and/or edge pixels can be missed if
-  // we sample from destination canvas invalid regions.
   const doc::frame_t frame = toolLoop->getFrame();
   doc::Cel* cel = layer->cel(frame);
   doc::Image* img = (cel ? cel->image() : nullptr);
-  if (!img) {
-    LOG(VERBOSE,
-        "ONLINE: stroke sync: missing cel image, sending transparent rect (%d,%d %dx%d)\n",
-        spriteRc.x,
-        spriteRc.y,
-        spriteRc.w,
-        spriteRc.h);
-  }
 
-  // Fill with the mask color by default. This is important for eraser strokes:
-  // if the cel image shrinks after commit (or is deleted when empty), regions
-  // outside the current cel bounds still need to be synced as transparent pixels.
   const int bpp = (img ? img->bytesPerPixel() : (spr ? spr->spec().bytesPerPixel() : 0));
   if (bpp <= 0)
     return;
@@ -1831,7 +1415,6 @@ void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
     std::fill(bytes.begin(), bytes.end(), 0);
   }
   else {
-    // Repeat the low bpp bytes from maskColor (Image pixels are stored in little-endian order).
     uint8_t maskBytes[4] = { 0, 0, 0, 0 };
     std::memcpy(maskBytes, &maskColor, (std::min)(4, bpp));
     for (size_t i = 0; i < bytes.size(); i += size_t(bpp))
@@ -1868,7 +1451,7 @@ void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
   payload.writeS32(spriteRc.h);
   payload.writeBytes(bytes);
 
-  if (m_role == Role::Host && m_host) {
+  if (m_role == Role::Host) {
     const uint64_t rev = m_nextRev++;
     Writer w;
     w.writeU8(uint8_t(MsgType::Op));
@@ -1876,37 +1459,22 @@ void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
     w.writeU32(1);
     w.writeU8(uint8_t(OpType::SetPixelsRect));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-
-    // In PartyKit mode, host sends via client connection to relay
-    if (m_connType == ConnectionType::PartyKit && m_client && m_client->ws) {
-      const ix::WebSocketSendInfo info = m_client->ws->sendBinary(toString(w.data));
-      if (base::get_log_level() >= VERBOSE)
-        LOG(VERBOSE, "ONLINE: sent Op(SetPixelsRect) via PartyKit rev=%u bytes=%u success=%d\n",
-            unsigned(rev), unsigned(w.data.size()), int(info.success));
-    }
-    else {
-      m_host->broadcast(w.data);
-      if (base::get_log_level() >= VERBOSE)
-        LOG(VERBOSE, "ONLINE: sent Op(SetPixelsRect) rev=%u bytes=%u\n", unsigned(rev), unsigned(w.data.size()));
-    }
+    broadcastMessage(w.data);
   }
-  else if (m_role == Role::Guest && m_client && m_client->ws) {
+  else if (m_role == Role::Guest) {
     Writer w;
     w.writeU8(uint8_t(MsgType::OpPropose));
     w.writeU32(m_localPeerId);
     w.writeU64(m_nextClientOpId++);
     w.writeU8(uint8_t(OpType::SetPixelsRect));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    const ix::WebSocketSendInfo info = m_client->ws->sendBinary(toString(w.data));
-    if (base::get_log_level() >= VERBOSE) {
-      LOG(VERBOSE,
-          "ONLINE: sent OpPropose(SetPixelsRect) ok=%d buffered=%u bytes=%u\n",
-          int(info.success),
-          unsigned(m_client->ws->bufferedAmount()),
-          unsigned(w.data.size()));
-    }
+    sendToHost(w.data);
   }
 }
+
+//------------------------------------------------------------------------------
+// Frame/Layer requests
+//------------------------------------------------------------------------------
 
 bool OnlineSessionManager::requestNewFrame(Context* ctx,
                                           const std::string& content,
@@ -1930,13 +1498,12 @@ bool OnlineSessionManager::requestNewFrame(Context* ctx,
     w.writeU64(m_nextClientOpId++);
     w.writeU8(uint8_t(OpType::NewFrame));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    if (m_client && m_client->ws)
-      m_client->ws->sendBinary(toString(w.data));
+    sendToHost(w.data);
     return true;
   }
 
   applyNewFrame(content, insertAt);
-  if (m_host) {
+  {
     Writer payload;
     payload.writeString(content);
     payload.writeU32(uint32_t(insertAt));
@@ -1946,7 +1513,7 @@ bool OnlineSessionManager::requestNewFrame(Context* ctx,
     w.writeU32(1);
     w.writeU8(uint8_t(OpType::NewFrame));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    m_host->broadcast(w.data);
+    broadcastMessage(w.data);
   }
   return true;
 }
@@ -1969,13 +1536,12 @@ bool OnlineSessionManager::requestRemoveFrame(Context* ctx, doc::frame_t frame)
     w.writeU64(m_nextClientOpId++);
     w.writeU8(uint8_t(OpType::RemoveFrame));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    if (m_client && m_client->ws)
-      m_client->ws->sendBinary(toString(w.data));
+    sendToHost(w.data);
     return true;
   }
 
   applyRemoveFrame(frame);
-  if (m_host) {
+  {
     Writer payload;
     payload.writeU32(uint32_t(frame));
     Writer w;
@@ -1984,7 +1550,7 @@ bool OnlineSessionManager::requestRemoveFrame(Context* ctx, doc::frame_t frame)
     w.writeU32(1);
     w.writeU8(uint8_t(OpType::RemoveFrame));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    m_host->broadcast(w.data);
+    broadcastMessage(w.data);
   }
   return true;
 }
@@ -2014,13 +1580,12 @@ bool OnlineSessionManager::requestNewLayer(Context* ctx, doc::Layer* afterLayer,
     w.writeU64(m_nextClientOpId++);
     w.writeU8(uint8_t(OpType::NewLayer));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    if (m_client && m_client->ws)
-      m_client->ws->sendBinary(toString(w.data));
+    sendToHost(w.data);
     return true;
   }
 
   applyNewLayer(afterPath, name);
-  if (m_host) {
+  {
     Writer payload;
     payload.writeU32(uint32_t(afterPath.size()));
     for (uint32_t idx : afterPath)
@@ -2032,7 +1597,7 @@ bool OnlineSessionManager::requestNewLayer(Context* ctx, doc::Layer* afterLayer,
     w.writeU32(1);
     w.writeU8(uint8_t(OpType::NewLayer));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    m_host->broadcast(w.data);
+    broadcastMessage(w.data);
   }
   return true;
 }
@@ -2061,13 +1626,12 @@ bool OnlineSessionManager::requestRemoveLayer(Context* ctx, doc::Layer* layer)
     w.writeU64(m_nextClientOpId++);
     w.writeU8(uint8_t(OpType::RemoveLayer));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    if (m_client && m_client->ws)
-      m_client->ws->sendBinary(toString(w.data));
+    sendToHost(w.data);
     return true;
   }
 
   applyRemoveLayer(layerPath);
-  if (m_host) {
+  {
     Writer payload;
     payload.writeU32(uint32_t(layerPath.size()));
     for (uint32_t idx : layerPath)
@@ -2078,7 +1642,7 @@ bool OnlineSessionManager::requestRemoveLayer(Context* ctx, doc::Layer* layer)
     w.writeU32(1);
     w.writeU8(uint8_t(OpType::RemoveLayer));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    m_host->broadcast(w.data);
+    broadcastMessage(w.data);
   }
   return true;
 }
@@ -2108,13 +1672,12 @@ bool OnlineSessionManager::requestLayerLock(Context* ctx, doc::Layer* layer, boo
     w.writeU64(m_nextClientOpId++);
     w.writeU8(uint8_t(OpType::LayerLock));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    if (m_client && m_client->ws)
-      m_client->ws->sendBinary(toString(w.data));
+    sendToHost(w.data);
     return true;
   }
 
   applyLayerLock(layerPath, locked);
-  if (m_host) {
+  {
     Writer payload;
     payload.writeU32(uint32_t(layerPath.size()));
     for (uint32_t idx : layerPath)
@@ -2126,19 +1689,25 @@ bool OnlineSessionManager::requestLayerLock(Context* ctx, doc::Layer* layer, boo
     w.writeU32(1);
     w.writeU8(uint8_t(OpType::LayerLock));
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
-    m_host->broadcast(w.data);
+    broadcastMessage(w.data);
   }
   return true;
 }
 
+//------------------------------------------------------------------------------
+// Host moderation
+//------------------------------------------------------------------------------
+
 void OnlineSessionManager::hostSetGuestPermissions(uint32_t peerId, Permissions perms)
 {
   std::lock_guard lock(m_mutex);
-  if (m_role != Role::Host || !m_host || peerId == 1)
+  if (m_role != Role::Host || peerId == 1)
     return;
-  auto it = m_host->clients.find(peerId);
-  if (it == m_host->clients.end())
+
+  auto it = m_hostPeerInfo.find(peerId);
+  if (it == m_hostPeerInfo.end())
     return;
+
   it->second.perms = perms;
   m_peers[peerId].perms = perms;
 
@@ -2146,23 +1715,27 @@ void OnlineSessionManager::hostSetGuestPermissions(uint32_t peerId, Permissions 
   w.writeU8(uint8_t(MsgType::PermissionsSet));
   w.writeU32(peerId);
   w.writeU32(perms);
-  m_host->broadcast(w.data);
+  broadcastMessage(w.data);
 }
 
 void OnlineSessionManager::hostKick(uint32_t peerId, const std::string& reason)
 {
   std::lock_guard lock(m_mutex);
-  if (m_role != Role::Host || !m_host || peerId == 1)
+  if (m_role != Role::Host || peerId == 1)
     return;
 
   Writer w;
   w.writeU8(uint8_t(MsgType::Kick));
   w.writeString(reason);
-  m_host->sendTo(peerId, w.data);
+  sendToPeer(peerId, w.data);
 
-  m_host->clients.erase(peerId);
+  m_hostPeerInfo.erase(peerId);
   m_peers.erase(peerId);
 }
+
+//------------------------------------------------------------------------------
+// Chat
+//------------------------------------------------------------------------------
 
 void OnlineSessionManager::sendChat(const std::string& text)
 {
@@ -2170,133 +1743,95 @@ void OnlineSessionManager::sendChat(const std::string& text)
     return;
 
   std::lock_guard lock(m_mutex);
-  if (m_role == Role::Host && m_host) {
+  if (m_role == Role::Host) {
     Writer w;
     w.writeU8(uint8_t(MsgType::ChatBroadcast));
     w.writeU32(1);
     w.writeString(text);
-    m_host->broadcast(w.data);
+    broadcastMessage(w.data);
     appendChatLine(fmt::format("[1] {}", text));
     updateWindow();
   }
-  else if (m_role == Role::Guest && m_client && m_client->ws) {
+  else if (m_role == Role::Guest) {
     Writer w;
     w.writeU8(uint8_t(MsgType::ChatSend));
     w.writeU32(m_localPeerId);
     w.writeString(text);
-    m_client->ws->sendBinary(toString(w.data));
+    sendToHost(w.data);
   }
 }
 
-void OnlineSessionManager::onWelcome(uint32_t peerId, Permissions perms)
+//------------------------------------------------------------------------------
+// Cursor sharing
+//------------------------------------------------------------------------------
+
+void OnlineSessionManager::sendCursorPosition(int x, int y)
 {
   std::lock_guard lock(m_mutex);
-  m_localPeerId = peerId;
-  m_localPerms = perms;
-  m_peers[1] = Peer{ 1, kPermEditCanvas | kPermEditLayers | kPermLockLayers | kPermEditTimeline, "Host" };
-  std::string name = "You";
-  if (m_client && !m_client->username.empty())
-    name = fmt::format("{} ({})", m_client->username, peerId);
-  else
-    name = fmt::format("You ({})", peerId);
+  if (m_role == Role::None)
+    return;
 
-  m_peers[peerId] = Peer{ peerId, perms, name };
-  appendChatLine(fmt::format("Connected. Permissions: {}", perms));
-  updateWindow();
+  if ((m_localPerms & kPermEditCanvas) == 0)
+    return;
+
+  m_pendingCursorPos = gfx::Point(x, y);
+  m_cursorDirty = true;
+  m_cursorWasVisible = true;
+
+  Writer w;
+  w.writeU8(uint8_t(MsgType::CursorPosition));
+  w.writeU32(m_localPeerId);
+  w.writeS32(x);
+  w.writeS32(y);
+
+  if (m_role == Role::Host) {
+    broadcastMessage(w.data);
+  }
+  else if (m_role == Role::Guest) {
+    sendToHost(w.data);
+  }
 }
 
-void OnlineSessionManager::onSnapshotBegin(uint32_t sizeBytes)
+void OnlineSessionManager::sendCursorHide()
 {
   std::lock_guard lock(m_mutex);
-  m_pendingSnapshot.inProgress = true;
-  m_pendingSnapshot.sizeBytes = sizeBytes;
-  m_pendingSnapshot.bytes.clear();
-  m_pendingSnapshot.bytes.reserve(sizeBytes);
-  appendChatLine(fmt::format("Receiving snapshot ({} bytes)...", sizeBytes));
-  updateWindow();
+  if (m_role == Role::None)
+    return;
+
+  if (!m_cursorWasVisible)
+    return;
+
+  m_cursorWasVisible = false;
+  m_cursorDirty = false;
+
+  Writer w;
+  w.writeU8(uint8_t(MsgType::CursorHide));
+  w.writeU32(m_localPeerId);
+
+  if (m_role == Role::Host) {
+    broadcastMessage(w.data);
+  }
+  else if (m_role == Role::Guest) {
+    sendToHost(w.data);
+  }
 }
 
-void OnlineSessionManager::onSnapshotData(const std::vector<uint8_t>& chunk)
+std::vector<Peer> OnlineSessionManager::peersWithVisibleCursors() const
 {
   std::lock_guard lock(m_mutex);
-  if (!m_pendingSnapshot.inProgress)
-    return;
-  m_pendingSnapshot.bytes.insert(m_pendingSnapshot.bytes.end(), chunk.begin(), chunk.end());
+  std::vector<Peer> result;
+  for (const auto& [id, peer] : m_peers) {
+    if (id == m_localPeerId)
+      continue;
+    if (peer.cursorVisible)
+      result.push_back(peer);
+  }
+  return result;
 }
 
-void OnlineSessionManager::onSnapshotEnd(Context* ctx)
-{
-  std::vector<uint8_t> bytes;
-  {
-    std::lock_guard lock(m_mutex);
-    m_pendingSnapshot.inProgress = false;
-    bytes.swap(m_pendingSnapshot.bytes);
-    appendChatLine("Snapshot received.");
-  }
-
-  if (!ctx) {
-    ui::Alert::show("Cannot load snapshot (no context).");
-    return;
-  }
-  if (bytes.empty()) {
-    ui::Alert::show("Cannot load snapshot (empty).");
-    return;
-  }
-
-  const std::string fn = snapshotFilename();
-  base::make_all_directories(base::get_file_path(fn));
-  if (!writeFileBytes(fn, bytes)) {
-    ui::Alert::show("Cannot write snapshot file.");
-    return;
-  }
-
-  std::unique_ptr<Doc> doc(load_document(ctx, fn));
-  if (!doc) {
-    ui::Alert::show("Cannot load snapshot.");
-    return;
-  }
-
-  Doc* raw = doc.release();
-  raw->setContext(ctx);
-  ctx->documents().add(raw);
-  ctx->setActiveDocument(raw);
-
-  {
-    std::lock_guard lock(m_mutex);
-    m_doc = raw;
-    raw->setOnlineSessionReadOnly(m_localPerms == 0);
-  }
-
-  updateWindow();
-}
-
-void OnlineSessionManager::onPermissionsSet(uint32_t peerId, Permissions perms)
-{
-  std::lock_guard lock(m_mutex);
-  auto& p = m_peers[peerId];
-  p.id = peerId;
-  p.perms = perms;
-  if (peerId == m_localPeerId) {
-    m_localPerms = perms;
-    if (m_doc)
-      m_doc->setOnlineSessionReadOnly(m_localPerms == 0);
-    appendChatLine(fmt::format("Permissions updated: {}", perms));
-  }
-  updateWindow();
-}
-
-void OnlineSessionManager::onKick(const std::string& reason)
-{
-  ui::Alert::show(fmt::format("You were kicked.\n{}", reason).c_str());
-  leave();
-}
-
-void OnlineSessionManager::onChatBroadcast(uint32_t peerId, const std::string& text)
-{
-  std::lock_guard lock(m_mutex);
-  appendChatLine(fmt::format("[{}] {}", peerId, text));
-  updateWindow();
-}
+//------------------------------------------------------------------------------
+// Apply operations (shared between host and guest)
+//------------------------------------------------------------------------------
 
 void OnlineSessionManager::applySetPixelsRect(doc::frame_t frame,
                                               const std::vector<uint32_t>& layerPath,
@@ -2315,11 +1850,7 @@ void OnlineSessionManager::applySetPixelsRect(doc::frame_t frame,
         unsigned(layerPath.size()));
   }
 
-  Doc* doc = nullptr;
-  {
-    std::lock_guard lock(m_mutex);
-    doc = m_doc;
-  }
+  Doc* doc = m_doc;
   if (!doc)
     return;
 
@@ -2353,35 +1884,15 @@ void OnlineSessionManager::applySetPixelsRect(doc::frame_t frame,
   dstRc.offset(-celOrigin);
 
   gfx::Rect clippedDstRc = clipRectToImage(dstRc, dst);
-  if (clippedDstRc.isEmpty()) {
-    if (base::get_log_level() >= VERBOSE) {
-      LOG(VERBOSE,
-          "ONLINE: applySetPixelsRect: clipped empty celOrigin=(%d,%d) dstRc=(%d,%d %dx%d)\n",
-          celOrigin.x,
-          celOrigin.y,
-          dstRc.x,
-          dstRc.y,
-          dstRc.w,
-          dstRc.h);
-    }
+  if (clippedDstRc.isEmpty())
     return;
-  }
 
-  // validateDestCanvas expects regions in sprite coordinates.
   canvas.validateDestCanvas(gfx::Region(spriteRc));
 
   const int bpp = dst->bytesPerPixel();
   const size_t expected = size_t(spriteRc.w) * size_t(spriteRc.h) * size_t(bpp);
-  if (bytes.size() < expected) {
-    if (base::get_log_level() >= VERBOSE) {
-      LOG(VERBOSE,
-          "ONLINE: applySetPixelsRect: short bytes (have=%u expected=%u bpp=%d)\n",
-          unsigned(bytes.size()),
-          unsigned(expected),
-          bpp);
-    }
+  if (bytes.size() < expected)
     return;
-  }
 
   const int xSkip = clippedDstRc.x - dstRc.x;
   const int ySkip = clippedDstRc.y - dstRc.y;
@@ -2399,11 +1910,7 @@ void OnlineSessionManager::applySetPixelsRect(doc::frame_t frame,
 
 void OnlineSessionManager::applyNewFrame(const std::string& content, doc::frame_t insertAt)
 {
-  Doc* doc = nullptr;
-  {
-    std::lock_guard lock(m_mutex);
-    doc = m_doc;
-  }
+  Doc* doc = m_doc;
   if (!doc)
     return;
 
@@ -2424,11 +1931,7 @@ void OnlineSessionManager::applyNewFrame(const std::string& content, doc::frame_
 
 void OnlineSessionManager::applyRemoveFrame(doc::frame_t frame)
 {
-  Doc* doc = nullptr;
-  {
-    std::lock_guard lock(m_mutex);
-    doc = m_doc;
-  }
+  Doc* doc = m_doc;
   if (!doc)
     return;
 
@@ -2447,11 +1950,7 @@ void OnlineSessionManager::applyRemoveFrame(doc::frame_t frame)
 void OnlineSessionManager::applyNewLayer(const std::vector<uint32_t>& afterLayerPath,
                                          const std::string& name)
 {
-  Doc* doc = nullptr;
-  {
-    std::lock_guard lock(m_mutex);
-    doc = m_doc;
-  }
+  Doc* doc = m_doc;
   if (!doc)
     return;
 
@@ -2477,11 +1976,7 @@ void OnlineSessionManager::applyNewLayer(const std::vector<uint32_t>& afterLayer
 
 void OnlineSessionManager::applyRemoveLayer(const std::vector<uint32_t>& layerPath)
 {
-  Doc* doc = nullptr;
-  {
-    std::lock_guard lock(m_mutex);
-    doc = m_doc;
-  }
+  Doc* doc = m_doc;
   if (!doc)
     return;
 
@@ -2499,11 +1994,7 @@ void OnlineSessionManager::applyRemoveLayer(const std::vector<uint32_t>& layerPa
 
 void OnlineSessionManager::applyLayerLock(const std::vector<uint32_t>& layerPath, bool locked)
 {
-  Doc* doc = nullptr;
-  {
-    std::lock_guard lock(m_mutex);
-    doc = m_doc;
-  }
+  Doc* doc = m_doc;
   if (!doc)
     return;
 
@@ -2535,74 +2026,6 @@ std::vector<uint8_t> OnlineSessionManager::buildSnapshotBytes(Doc* doc)
     return {};
 
   return readFileBytes(fn);
-}
-
-void OnlineSessionManager::sendCursorPosition(int x, int y)
-{
-  std::lock_guard lock(m_mutex);
-  if (m_role == Role::None)
-    return;
-
-  // Only send if we have canvas edit permission
-  if ((m_localPerms & kPermEditCanvas) == 0)
-    return;
-
-  m_pendingCursorPos = gfx::Point(x, y);
-  m_cursorDirty = true;
-  m_cursorWasVisible = true;
-
-  // Send immediately (throttling can be added later via timer if needed)
-  Writer w;
-  w.writeU8(uint8_t(MsgType::CursorPosition));
-  w.writeU32(m_localPeerId);
-  w.writeS32(x);
-  w.writeS32(y);
-
-  if (m_role == Role::Host && m_host) {
-    m_host->broadcast(w.data);
-  }
-  else if (m_role == Role::Guest && m_client && m_client->ws) {
-    m_client->ws->sendBinary(toString(w.data));
-  }
-}
-
-void OnlineSessionManager::sendCursorHide()
-{
-  std::lock_guard lock(m_mutex);
-  if (m_role == Role::None)
-    return;
-
-  // Only send hide if we were previously visible
-  if (!m_cursorWasVisible)
-    return;
-
-  m_cursorWasVisible = false;
-  m_cursorDirty = false;
-
-  Writer w;
-  w.writeU8(uint8_t(MsgType::CursorHide));
-  w.writeU32(m_localPeerId);
-
-  if (m_role == Role::Host && m_host) {
-    m_host->broadcast(w.data);
-  }
-  else if (m_role == Role::Guest && m_client && m_client->ws) {
-    m_client->ws->sendBinary(toString(w.data));
-  }
-}
-
-std::vector<Peer> OnlineSessionManager::peersWithVisibleCursors() const
-{
-  std::lock_guard lock(m_mutex);
-  std::vector<Peer> result;
-  for (const auto& [id, peer] : m_peers) {
-    // Don't include local peer's cursor
-    if (id == m_localPeerId)
-      continue;
-    if (peer.cursorVisible)
-      result.push_back(peer);
-  }
-  return result;
 }
 
 } // namespace app::online

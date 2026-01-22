@@ -568,6 +568,7 @@ target_sources(app-lib PRIVATE
   modules/gui.cpp
   online/online_protocol.cpp
   online/online_session_manager.cpp
+  online/transport.cpp
   modules/palettes.cpp
   pref/preferences.cpp
   recent_files.cpp

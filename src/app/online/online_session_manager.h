@@ -8,6 +8,7 @@
 #define APP_ONLINE_SESSION_MANAGER_H_INCLUDED
 #pragma once
 
+#include "app/online/online_protocol.h"
 #include "doc/frame.h"
 #include "gfx/point.h"
 #include "gfx/rect.h"
@@ -34,6 +35,8 @@ class ToolLoop;
 }} // namespace app::tools
 
 namespace app::online {
+
+class ITransport;
 
 using Permissions = uint32_t;
 static constexpr Permissions kPermEditCanvas = 1u << 0;
@@ -114,19 +117,39 @@ private:
     std::vector<uint8_t> bytes;
   };
 
-  struct NetHost;
-  struct NetClient;
+  // Per-peer state tracked by the host
+  struct HostPeerInfo {
+    Permissions perms = 0;
+    std::string username;
+    bool authenticated = false;
+  };
 
   void updateWindow();
   void appendChatLine(const std::string& line);
 
+  // Unified message handling
+  void handleMessage(uint32_t senderPeerId, const std::string& data);
+  void handleHostMessage(uint32_t senderPeerId, MsgType type, Reader& r);
+  void handleGuestMessage(MsgType type, Reader& r);
+
+  // Host-side message handlers
+  void handleHello(uint32_t senderPeerId, Reader& r);
+  void handleOpPropose(uint32_t senderPeerId, Reader& r);
+  void handleChatSend(uint32_t senderPeerId, Reader& r);
+  void handleCursorPosition(uint32_t senderPeerId, Reader& r);
+  void handleCursorHide(uint32_t senderPeerId, Reader& r);
+
+  // Guest-side response handlers
   void onWelcome(uint32_t peerId, Permissions perms);
   void onSnapshotBegin(uint32_t sizeBytes);
   void onSnapshotData(const std::vector<uint8_t>& chunk);
-  void onSnapshotEnd(Context* ctx);
+  void onSnapshotEnd();
+  void onOp(uint64_t rev, uint32_t authorPeerId, OpType opType, Reader& opReader);
   void onPermissionsSet(uint32_t peerId, Permissions perms);
   void onKick(const std::string& reason);
   void onChatBroadcast(uint32_t peerId, const std::string& text);
+  void onCursorPosition(uint32_t peerId, int32_t x, int32_t y);
+  void onCursorHide(uint32_t peerId);
 
   void applySetPixelsRect(doc::frame_t frame,
                           const std::vector<uint32_t>& layerPath,
@@ -140,24 +163,35 @@ private:
 
   std::vector<uint8_t> buildSnapshotBytes(Doc* doc);
 
+  // Transport layer helpers
+  void setupTransportCallbacks();
+  void broadcastMessage(const std::vector<uint8_t>& data);
+  void sendToHost(const std::vector<uint8_t>& data);
+  void sendToPeer(uint32_t peerId, const std::vector<uint8_t>& data);
+
 private:
   mutable std::recursive_mutex m_mutex;
 
   Role m_role = Role::None;
   ConnectionType m_connType = ConnectionType::None;
   Doc* m_doc = nullptr;
+  Context* m_ctx = nullptr; // Context for loading snapshots
   std::string m_roomName; // For PartyKit sessions
+  std::string m_localUsername;
+  std::string m_password;
 
   uint32_t m_localPeerId = 0;
   Permissions m_localPerms = 0;
 
   uint64_t m_nextClientOpId = 1;
   uint64_t m_nextRev = 1;
+  uint32_t m_nextPeerId = 2; // Host is 1, guests start at 2
 
-  std::unique_ptr<NetHost> m_host;
-  std::unique_ptr<NetClient> m_client;
+  std::unique_ptr<ITransport> m_transport;
+  std::vector<uint8_t> m_snapshotBytes; // Host's snapshot for sending to guests
 
   std::map<uint32_t, Peer> m_peers;
+  std::map<uint32_t, HostPeerInfo> m_hostPeerInfo; // Only used by host
   PendingSnapshot m_pendingSnapshot;
 
   std::string m_chatLog;

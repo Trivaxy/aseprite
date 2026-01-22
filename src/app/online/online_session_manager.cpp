@@ -21,6 +21,7 @@
 #include "app/tools/ink.h"
 #include "app/tools/tool_loop.h"
 #include "app/tx.h"
+#include "app/ui/online_session_window.h"
 #include "app/util/expand_cel_canvas.h"
 #include "base/fs.h"
 #include "base/log.h"
@@ -32,11 +33,10 @@
 #include "fmt/format.h"
 #include "ui/alert.h"
 #include "ui/system.h"
-#include "app/ui/online_session_window.h"
 
-#include <fstream>
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <ixwebsocket/IXNetSystem.h>
 
 namespace app::online {
@@ -970,24 +970,24 @@ void OnlineSessionManager::onSnapshotEnd()
   appendChatLine("Snapshot received.");
 
   if (!m_ctx) {
-    ui::Alert::show("Cannot load snapshot (no context).");
+    ui::Alert::show("Snapshot Error<<Cannot load snapshot (no context).");
     return;
   }
   if (bytes.empty()) {
-    ui::Alert::show("Cannot load snapshot (empty).");
+    ui::Alert::show("Snapshot Error<<Cannot load snapshot (empty).");
     return;
   }
 
   const std::string fn = snapshotFilename();
   base::make_all_directories(base::get_file_path(fn));
   if (!writeFileBytes(fn, bytes)) {
-    ui::Alert::show("Cannot write snapshot file.");
+    ui::Alert::show("Snapshot Error<<Cannot write snapshot file.");
     return;
   }
 
   std::unique_ptr<Doc> doc(load_document(m_ctx, fn));
   if (!doc) {
-    ui::Alert::show("Cannot load snapshot.");
+    ui::Alert::show("Snapshot Error<<Cannot load snapshot.");
     return;
   }
 
@@ -1192,7 +1192,7 @@ void OnlineSessionManager::sendToPeer(uint32_t peerId, const std::vector<uint8_t
 bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std::string& username, const std::string& password, const std::string& bindAddress)
 {
   if (!ctx || !doc) {
-    ui::Alert::show("No active document to host.");
+    ui::Alert::show("Online Session Error<<No active document to host.");
     return false;
   }
 
@@ -1201,7 +1201,7 @@ bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std
 
   m_snapshotBytes = buildSnapshotBytes(doc);
   if (m_snapshotBytes.empty()) {
-    ui::Alert::show("Failed to build snapshot.");
+    ui::Alert::show("Online Session Error<<Failed to build snapshot.");
     stopNoLock();
     return false;
   }
@@ -1225,7 +1225,7 @@ bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std
   setupTransportCallbacks();
 
   if (!m_transport->start()) {
-    ui::Alert::show("Failed to start server.");
+    ui::Alert::show("Online Session Error<<Failed to start server.");
     stopNoLock();
     return false;
   }
@@ -1238,7 +1238,7 @@ bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std
 bool OnlineSessionManager::join(Context* ctx, const std::string& address, int port, const std::string& username, const std::string& password)
 {
   if (!ctx) {
-    ui::Alert::show("No context.");
+    ui::Alert::show("Online Session Error<<No context.");
     return false;
   }
 
@@ -1271,12 +1271,12 @@ bool OnlineSessionManager::join(Context* ctx, const std::string& address, int po
 bool OnlineSessionManager::startHostPartyKit(Context* ctx, Doc* doc, const std::string& roomName, const std::string& username, const std::string& password)
 {
   if (!ctx || !doc) {
-    ui::Alert::show("No active document to host.");
+    ui::Alert::show("Online Session Error<<No active document to host.");
     return false;
   }
 
   if (roomName.empty()) {
-    ui::Alert::show("Room name cannot be empty.");
+    ui::Alert::show("Online Session Error<<Room name cannot be empty.");
     return false;
   }
 
@@ -1285,7 +1285,7 @@ bool OnlineSessionManager::startHostPartyKit(Context* ctx, Doc* doc, const std::
 
   m_snapshotBytes = buildSnapshotBytes(doc);
   if (m_snapshotBytes.empty()) {
-    ui::Alert::show("Failed to build snapshot.");
+    ui::Alert::show("Online Session Error<<Failed to build snapshot.");
     stopNoLock();
     return false;
   }
@@ -1318,12 +1318,12 @@ bool OnlineSessionManager::startHostPartyKit(Context* ctx, Doc* doc, const std::
 bool OnlineSessionManager::joinPartyKit(Context* ctx, const std::string& roomName, const std::string& username, const std::string& password)
 {
   if (!ctx) {
-    ui::Alert::show("No context.");
+    ui::Alert::show("Online Session Error<<No context.");
     return false;
   }
 
   if (roomName.empty()) {
-    ui::Alert::show("Room name cannot be empty.");
+    ui::Alert::show("Online Session Error<<Room name cannot be empty.");
     return false;
   }
 
@@ -1477,8 +1477,8 @@ void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
 //------------------------------------------------------------------------------
 
 bool OnlineSessionManager::requestNewFrame(Context* ctx,
-                                          const std::string& content,
-                                          doc::frame_t insertAt)
+                                           const std::string& content,
+                                           doc::frame_t insertAt)
 {
   std::lock_guard lock(m_mutex);
   if (m_role == Role::None || !m_doc || !ctx || ctx->activeDocument() != m_doc)

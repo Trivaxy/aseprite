@@ -144,7 +144,8 @@ void RemoveLayerCommand::onExecute(Context* context)
   if (session->isActive() && session->document() == document) {
     const Site& site = writer.site();
     if (site.inTimeline() && !site.selectedLayers().empty()) {
-      ui::Alert::show("Removing multiple layers is not supported in Online Sessions V1.");
+      ui::Alert::show(
+        "Online Sessions<<Removing multiple layers is not supported in Online Sessions yet.");
       return;
     }
     if (auto* layer = writer.layer())

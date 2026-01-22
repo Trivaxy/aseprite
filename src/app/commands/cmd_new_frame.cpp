@@ -90,8 +90,9 @@ void NewFrameCommand::onExecute(Context* context)
     switch (m_content) {
       case Content::DUPLICATE_FRAME: content = "frame"; break;
       case Content::NEW_EMPTY_FRAME: content = "empty"; break;
-      default: {
-        ui::Alert::show("This New Frame mode is not supported in Online Sessions V1.");
+      default:                       {
+        ui::Alert::show(
+          "Online Sessions<<This New Frame mode is not supported in Online Sessions yet.");
         return;
       }
     }

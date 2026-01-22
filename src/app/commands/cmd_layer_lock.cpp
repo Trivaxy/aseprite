@@ -76,7 +76,8 @@ void LayerLockCommand::onExecute(Context* context)
   if (session->isActive() && session->document() == doc) {
     auto range = context->range();
     if (range.enabled()) {
-      ui::Alert::show("Locking multiple layers is not supported in Online Sessions V1.");
+      ui::Alert::show(
+        "Online Sessions<<Locking multiple layers is not supported in Online Sessions yet.");
       return;
     }
     if (auto* layer = writer.layer()) {

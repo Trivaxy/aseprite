@@ -165,7 +165,8 @@ void NewLayerCommand::onExecute(Context* context)
   if (session->isActive() && session->document() == document) {
     if (params().ask() || params().fromFile() || params().fromClipboard() || params().viaCut() ||
         params().viaCopy() || params().group() || params().reference() || params().tilemap()) {
-      ui::Alert::show("This New Layer mode is not supported in Online Sessions V1.");
+      ui::Alert::show(
+        "Online Sessions<<This New Layer mode is not supported in Online Sessions yet.");
       return;
     }
 

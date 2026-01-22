@@ -33,6 +33,9 @@ enum class MsgType : uint8_t {
 
   ChatSend = 40,
   ChatBroadcast = 41,
+
+  CursorPosition = 50,
+  CursorHide = 51,
 };
 
 enum class OpType : uint8_t {

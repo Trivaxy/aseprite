@@ -56,6 +56,7 @@
 #include "app/ui_context.h"
 #include "app/util/layer_utils.h"
 #include "app/util/tile_flags_utils.h"
+#include "app/online/online_session_manager.h"
 #include "base/chrono.h"
 #include "base/convert_to.h"
 #include "base/scoped_value.h"
@@ -1067,6 +1068,9 @@ void Editor::drawSpriteUnclippedRect(ui::Graphics* g, const gfx::Rect& _rc)
     EditorPostRenderImpl postRender(this, g);
     m_decorator->postRenderDecorator(&postRender);
   }
+
+  // Draw remote cursors from online session
+  drawRemoteCursors(g);
 }
 
 void Editor::drawSpriteClipped(const gfx::Region& updateRegion)
@@ -1285,6 +1289,51 @@ void Editor::drawSlices(ui::Graphics* g)
     else {
       g->drawRect(color, out);
     }
+  }
+}
+
+void Editor::drawRemoteCursors(ui::Graphics* g)
+{
+  auto* mgr = online::OnlineSessionManager::instance();
+  if (!mgr->isActive() || mgr->document() != m_document)
+    return;
+
+  auto peers = mgr->peersWithVisibleCursors();
+  if (peers.empty())
+    return;
+
+  // Purple color matching the reference image
+  const gfx::Color cursorColor = gfx::rgba(106, 90, 205, 255);  // SlateBlue
+  const gfx::Color labelBgColor = cursorColor;
+  const gfx::Color labelFgColor = gfx::rgba(255, 255, 255, 255);
+
+  for (const auto& peer : peers) {
+    // Convert sprite position to screen position
+    gfx::Point screenPos = editorToScreen(peer.cursorPos);
+    screenPos -= bounds().origin();
+
+    // Draw 2x2 pixel cursor marker
+    const int cursorSize = 2;
+    g->fillRect(cursorColor, gfx::Rect(screenPos.x, screenPos.y, cursorSize, cursorSize));
+
+    // Draw username label
+    const std::string& name = peer.name;
+    const gfx::Size textSize = g->measureText(name);
+    const int labelPadding = 2;
+
+    // Position label to the right and slightly above the cursor
+    gfx::Rect labelRect(
+      screenPos.x + cursorSize + 2,
+      screenPos.y - textSize.h - labelPadding,
+      textSize.w + labelPadding * 2,
+      textSize.h + labelPadding * 2);
+
+    // Draw label background
+    g->fillRect(labelBgColor, labelRect);
+
+    // Draw label text
+    g->drawText(name, labelFgColor, gfx::ColorNone,
+                gfx::Point(labelRect.x + labelPadding, labelRect.y + labelPadding));
   }
 }
 

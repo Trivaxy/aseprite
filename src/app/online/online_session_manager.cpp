@@ -764,6 +764,67 @@ bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std
             updateWindow();
           });
         }
+        else if (type == MsgType::CursorPosition) {
+          uint32_t claimedPeerId = 0;
+          int32_t x = 0, y = 0;
+          if (!r.readU32(claimedPeerId) || !r.readS32(x) || !r.readS32(y))
+            return;
+          if (claimedPeerId != peerId)
+            return;
+
+          ui::execute_from_ui_thread([this, peerId, x, y] {
+            std::lock_guard lock(m_mutex);
+            if (!m_host)
+              return;
+
+            // Validate peer has canvas edit permission
+            auto clientIt = m_host->clients.find(peerId);
+            if (clientIt == m_host->clients.end())
+              return;
+            if ((clientIt->second.perms & kPermEditCanvas) == 0)
+              return;
+
+            // Update stored cursor position
+            auto peerIt = m_peers.find(peerId);
+            if (peerIt != m_peers.end()) {
+              peerIt->second.cursorPos = gfx::Point(x, y);
+              peerIt->second.cursorVisible = true;
+            }
+
+            // Broadcast to all clients (including sender so they know it was accepted)
+            Writer w;
+            w.writeU8(uint8_t(MsgType::CursorPosition));
+            w.writeU32(peerId);
+            w.writeS32(x);
+            w.writeS32(y);
+            m_host->broadcast(w.data);
+          });
+        }
+        else if (type == MsgType::CursorHide) {
+          uint32_t claimedPeerId = 0;
+          if (!r.readU32(claimedPeerId))
+            return;
+          if (claimedPeerId != peerId)
+            return;
+
+          ui::execute_from_ui_thread([this, peerId] {
+            std::lock_guard lock(m_mutex);
+            if (!m_host)
+              return;
+
+            // Update stored cursor visibility
+            auto peerIt = m_peers.find(peerId);
+            if (peerIt != m_peers.end()) {
+              peerIt->second.cursorVisible = false;
+            }
+
+            // Broadcast to all clients
+            Writer w;
+            w.writeU8(uint8_t(MsgType::CursorHide));
+            w.writeU32(peerId);
+            m_host->broadcast(w.data);
+          });
+        }
       });
     }
   });
@@ -1067,6 +1128,34 @@ bool OnlineSessionManager::join(Context* ctx, const std::string& address, int po
         if (!r.readU32(peerId) || !r.readString(text))
           return;
         ui::execute_from_ui_thread([this, peerId, text] { onChatBroadcast(peerId, text); });
+        break;
+      }
+      case MsgType::CursorPosition: {
+        uint32_t peerId = 0;
+        int32_t x = 0, y = 0;
+        if (!r.readU32(peerId) || !r.readS32(x) || !r.readS32(y))
+          return;
+        ui::execute_from_ui_thread([this, peerId, x, y] {
+          std::lock_guard lock(m_mutex);
+          auto it = m_peers.find(peerId);
+          if (it != m_peers.end()) {
+            it->second.cursorPos = gfx::Point(x, y);
+            it->second.cursorVisible = true;
+          }
+        });
+        break;
+      }
+      case MsgType::CursorHide: {
+        uint32_t peerId = 0;
+        if (!r.readU32(peerId))
+          return;
+        ui::execute_from_ui_thread([this, peerId] {
+          std::lock_guard lock(m_mutex);
+          auto it = m_peers.find(peerId);
+          if (it != m_peers.end()) {
+            it->second.cursorVisible = false;
+          }
+        });
         break;
       }
       default: break;
@@ -1868,6 +1957,74 @@ std::vector<uint8_t> OnlineSessionManager::buildSnapshotBytes(Doc* doc)
     return {};
 
   return readFileBytes(fn);
+}
+
+void OnlineSessionManager::sendCursorPosition(int x, int y)
+{
+  std::lock_guard lock(m_mutex);
+  if (m_role == Role::None)
+    return;
+
+  // Only send if we have canvas edit permission
+  if ((m_localPerms & kPermEditCanvas) == 0)
+    return;
+
+  m_pendingCursorPos = gfx::Point(x, y);
+  m_cursorDirty = true;
+  m_cursorWasVisible = true;
+
+  // Send immediately (throttling can be added later via timer if needed)
+  Writer w;
+  w.writeU8(uint8_t(MsgType::CursorPosition));
+  w.writeU32(m_localPeerId);
+  w.writeS32(x);
+  w.writeS32(y);
+
+  if (m_role == Role::Host && m_host) {
+    m_host->broadcast(w.data);
+  }
+  else if (m_role == Role::Guest && m_client && m_client->ws) {
+    m_client->ws->sendBinary(toString(w.data));
+  }
+}
+
+void OnlineSessionManager::sendCursorHide()
+{
+  std::lock_guard lock(m_mutex);
+  if (m_role == Role::None)
+    return;
+
+  // Only send hide if we were previously visible
+  if (!m_cursorWasVisible)
+    return;
+
+  m_cursorWasVisible = false;
+  m_cursorDirty = false;
+
+  Writer w;
+  w.writeU8(uint8_t(MsgType::CursorHide));
+  w.writeU32(m_localPeerId);
+
+  if (m_role == Role::Host && m_host) {
+    m_host->broadcast(w.data);
+  }
+  else if (m_role == Role::Guest && m_client && m_client->ws) {
+    m_client->ws->sendBinary(toString(w.data));
+  }
+}
+
+std::vector<Peer> OnlineSessionManager::peersWithVisibleCursors() const
+{
+  std::lock_guard lock(m_mutex);
+  std::vector<Peer> result;
+  for (const auto& [id, peer] : m_peers) {
+    // Don't include local peer's cursor
+    if (id == m_localPeerId)
+      continue;
+    if (peer.cursorVisible)
+      result.push_back(peer);
+  }
+  return result;
 }
 
 } // namespace app::online

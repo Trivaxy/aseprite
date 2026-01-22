@@ -9,6 +9,7 @@
 #pragma once
 
 #include "doc/frame.h"
+#include "gfx/point.h"
 #include "gfx/rect.h"
 #include "gfx/region.h"
 
@@ -44,6 +45,8 @@ struct Peer {
   uint32_t id = 0;
   Permissions perms = 0;
   std::string name;
+  gfx::Point cursorPos{0, 0};
+  bool cursorVisible = false;
 };
 
 class OnlineSessionWindow;
@@ -86,6 +89,11 @@ public:
   void hostKick(uint32_t peerId, const std::string& reason);
 
   void sendChat(const std::string& text);
+
+  // Cursor sharing
+  void sendCursorPosition(int x, int y);
+  void sendCursorHide();
+  std::vector<Peer> peersWithVisibleCursors() const;
 
 private:
   OnlineSessionManager();
@@ -145,6 +153,11 @@ private:
 
   std::string m_chatLog;
   OnlineSessionWindow* m_window = nullptr; // owned by UI
+
+  // Cursor state
+  gfx::Point m_pendingCursorPos{0, 0};
+  bool m_cursorDirty = false;
+  bool m_cursorWasVisible = false;
 };
 
 } // namespace app::online

@@ -50,6 +50,7 @@
 #include "app/ui/skin/skin_theme.h"
 #include "app/ui/status_bar.h"
 #include "app/ui_context.h"
+#include "app/online/online_session_manager.h"
 #include "app/util/layer_utils.h"
 #include "app/util/new_image_from_mask.h"
 #include "app/util/readable_time.h"
@@ -344,6 +345,19 @@ bool StandbyState::onMouseUp(Editor* editor, MouseMessage* msg)
 
 bool StandbyState::onMouseMove(Editor* editor, MouseMessage* msg)
 {
+  // Send cursor position to online session if active
+  if (auto* mgr = online::OnlineSessionManager::instance(); mgr->isActive()) {
+    if (editor->sprite()) {
+      gfx::Point spritePos = editor->screenToEditor(msg->position());
+      if (editor->sprite()->bounds().contains(spritePos)) {
+        mgr->sendCursorPosition(spritePos.x, spritePos.y);
+      }
+      else {
+        mgr->sendCursorHide();
+      }
+    }
+  }
+
   // We control eyedropper tool from here. TODO move this to another place
   if (msg->left() || msg->right()) {
     tools::Ink* clickedInk = editor->getCurrentEditorInk();

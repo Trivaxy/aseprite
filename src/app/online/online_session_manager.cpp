@@ -165,7 +165,11 @@ struct OnlineSessionManager::NetHost {
   struct ClientConn {
     std::weak_ptr<ix::WebSocket> wsWeak;
     Permissions perms = 0; // viewer
+    std::string username;
+    bool authenticated = false;
   };
+
+  std::string password;
 
   std::map<uint32_t, ClientConn> clients;
   uint32_t nextPeerId = 2; // host is 1
@@ -212,6 +216,8 @@ struct OnlineSessionManager::NetHost {
 struct OnlineSessionManager::NetClient {
   std::unique_ptr<ix::WebSocket> ws;
   std::string url;
+  std::string username;
+  std::string password;
 };
 
 OnlineSessionManager* OnlineSessionManager::instance()
@@ -347,7 +353,7 @@ void OnlineSessionManager::stopNoLock()
   m_nextRev = 1;
 }
 
-bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std::string& bindAddress)
+bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std::string& username, const std::string& password, const std::string& bindAddress)
 {
   if (!ctx || !doc) {
     ui::Alert::show("No active document to host.");
@@ -365,12 +371,14 @@ bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std
     return false;
   }
 
+  host->password = password;
+
   m_role = Role::Host;
   m_doc = doc;
   m_localPeerId = 1;
   m_localPerms = (kPermEditCanvas | kPermEditLayers | kPermLockLayers | kPermEditTimeline);
   m_peers.clear();
-  m_peers[m_localPeerId] = Peer{ m_localPeerId, m_localPerms, "Host" };
+  m_peers[m_localPeerId] = Peer{ m_localPeerId, m_localPerms, username.empty() ? "Host" : username };
 
   host->server = std::make_unique<ix::WebSocketServer>(port, bindAddress);
   host->server->disablePerMessageDeflate();
@@ -385,9 +393,8 @@ bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std
       std::lock_guard lock(m_mutex);
       if (!m_host)
         return;
-      peerId = m_host->nextPeerId++;
       m_host->clients[peerId] = NetHost::ClientConn{ wsWeak, 0 };
-      m_peers[peerId] = Peer{ peerId, 0, fmt::format("Guest {}", peerId) };
+      // Do NOT add to m_peers yet. Wait for Hello.
     }
 
     if (auto ws = wsWeak.lock()) {
@@ -396,61 +403,29 @@ bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std
           return;
 
         if (msg->type == ix::WebSocketMessageType::Open) {
-          std::vector<uint8_t> snapshot;
-          {
-            std::lock_guard lock(m_mutex);
-            if (!m_host)
-              return;
-            snapshot = m_host->snapshotBytes;
-          }
-
-          if (auto ws = wsWeak.lock()) {
-            Writer w;
-            w.writeU8(uint8_t(MsgType::Welcome));
-            w.writeU32(peerId);
-            w.writeU32(0);
-            ws->sendBinary(toString(w.data));
-
-            Writer wb;
-            wb.writeU8(uint8_t(MsgType::SnapshotBegin));
-            wb.writeU32(uint32_t(snapshot.size()));
-            ws->sendBinary(toString(wb.data));
-
-            static constexpr size_t kChunkSize = 128 * 1024;
-            size_t offset = 0;
-            while (offset < snapshot.size()) {
-              const size_t remaining = snapshot.size() - offset;
-              const size_t n = (remaining < kChunkSize ? remaining : kChunkSize);
-              std::vector<uint8_t> chunk(snapshot.begin() + offset, snapshot.begin() + offset + n);
-              Writer wd;
-              wd.writeU8(uint8_t(MsgType::SnapshotData));
-              wd.writeBytes(chunk);
-              ws->sendBinary(toString(wd.data));
-              offset += n;
-            }
-
-            Writer we;
-            we.writeU8(uint8_t(MsgType::SnapshotEnd));
-            ws->sendBinary(toString(we.data));
-          }
-
-          ui::execute_from_ui_thread([this, peerId] {
-            std::lock_guard lock(m_mutex);
-            appendChatLine(fmt::format("Guest {} connected.", peerId));
-            updateWindow();
-          });
+          // Wait for Hello
           return;
         }
 
         if (msg->type == ix::WebSocketMessageType::Close) {
           ui::execute_from_ui_thread([this, peerId] {
             std::lock_guard lock(m_mutex);
+            bool wasAuth = false;
+            std::string name;
             if (m_host) {
-              m_host->clients.erase(peerId);
-              m_peers.erase(peerId);
+              auto it = m_host->clients.find(peerId);
+              if (it != m_host->clients.end()) {
+                wasAuth = it->second.authenticated;
+                name = it->second.username;
+                m_host->clients.erase(it);
+              }
+              if (wasAuth)
+                 m_peers.erase(peerId);
             }
-            appendChatLine(fmt::format("Guest {} disconnected.", peerId));
-            updateWindow();
+            if (wasAuth) {
+              appendChatLine(fmt::format("{} disconnected.", name.empty() ? fmt::format("Guest {}", peerId) : name));
+              updateWindow();
+            }
           });
           return;
         }
@@ -463,6 +438,96 @@ bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std
         if (!r.readU8(type8))
           return;
         const auto type = MsgType(type8);
+
+        if (type == MsgType::Hello) {
+          std::string user, pass;
+          if (!r.readString(user) || !r.readString(pass))
+            return;
+
+          ui::execute_from_ui_thread([this, wsWeak, peerId, user, pass] {
+             std::lock_guard lock(m_mutex);
+             if (!m_host) return;
+
+             // Validate Password
+             if (!m_host->password.empty() && m_host->password != pass) {
+               if (auto ws = wsWeak.lock()) {
+                 Writer w;
+                 w.writeU8(uint8_t(MsgType::Error));
+                 w.writeString("Invalid password");
+                 ws->sendBinary(toString(w.data));
+                 ws->stop(); // Close connection
+               }
+               return;
+             }
+
+             // Validate Username
+             for (const auto& [id, p] : m_peers) {
+               if (p.name == user) {
+                 if (auto ws = wsWeak.lock()) {
+                   Writer w;
+                   w.writeU8(uint8_t(MsgType::Error));
+                   w.writeString("Username taken");
+                   ws->sendBinary(toString(w.data));
+                   ws->stop();
+                 }
+                 return;
+               }
+             }
+
+             // Authenticate
+             auto it = m_host->clients.find(peerId);
+             if (it == m_host->clients.end()) return;
+
+             it->second.authenticated = true;
+             it->second.username = user;
+             m_peers[peerId] = Peer{ peerId, 0, user };
+
+             if (auto ws = wsWeak.lock()) {
+                Writer w;
+                w.writeU8(uint8_t(MsgType::Welcome));
+                w.writeU32(peerId);
+                w.writeU32(0);
+                ws->sendBinary(toString(w.data));
+
+                std::vector<uint8_t> snapshot = m_host->snapshotBytes;
+                Writer wb;
+                wb.writeU8(uint8_t(MsgType::SnapshotBegin));
+                wb.writeU32(uint32_t(snapshot.size()));
+                ws->sendBinary(toString(wb.data));
+
+                static constexpr size_t kChunkSize = 128 * 1024;
+                size_t offset = 0;
+                while (offset < snapshot.size()) {
+                  const size_t remaining = snapshot.size() - offset;
+                  const size_t n = (remaining < kChunkSize ? remaining : kChunkSize);
+                  std::vector<uint8_t> chunk(snapshot.begin() + offset, snapshot.begin() + offset + n);
+                  Writer wd;
+                  wd.writeU8(uint8_t(MsgType::SnapshotData));
+                  wd.writeBytes(chunk);
+                  ws->sendBinary(toString(wd.data));
+                  offset += n;
+                }
+
+                Writer we;
+                we.writeU8(uint8_t(MsgType::SnapshotEnd));
+                ws->sendBinary(toString(we.data));
+             }
+
+             appendChatLine(fmt::format("{} connected.", user));
+             updateWindow();
+          });
+          return;
+        }
+
+        // Require Authentication for other ops
+        {
+          std::lock_guard lock(m_mutex);
+          if (m_host) {
+            auto it = m_host->clients.find(peerId);
+            if (it == m_host->clients.end() || !it->second.authenticated)
+              return;
+          }
+        }
 
         if (type == MsgType::OpPropose) {
           uint32_t claimedPeerId = 0;
@@ -715,7 +780,7 @@ bool OnlineSessionManager::startHost(Context* ctx, Doc* doc, int port, const std
   return true;
 }
 
-bool OnlineSessionManager::join(Context* ctx, const std::string& address, int port)
+bool OnlineSessionManager::join(Context* ctx, const std::string& address, int port, const std::string& username, const std::string& password)
 {
   if (!ctx) {
     ui::Alert::show("No context.");
@@ -734,8 +799,12 @@ bool OnlineSessionManager::join(Context* ctx, const std::string& address, int po
   auto client = std::make_unique<NetClient>();
   client->ws = std::make_unique<ix::WebSocket>();
   client->ws->disablePerMessageDeflate();
+  client->ws->disableAutomaticReconnection();
   client->url = fmt::format("ws://{}:{}/", address, port);
   client->ws->setUrl(client->url);
+
+  client->username = username;
+  client->password = password;
 
   client->ws->setOnMessageCallback([this, ctx](const ix::WebSocketMessagePtr& msg) {
     if (!msg)
@@ -744,8 +813,16 @@ bool OnlineSessionManager::join(Context* ctx, const std::string& address, int po
     if (msg->type == ix::WebSocketMessageType::Open) {
       ui::execute_from_ui_thread([this] {
         std::lock_guard lock(m_mutex);
-        appendChatLine("Socket connected.");
+        if (!m_client) return;
+        
+        appendChatLine("Socket connected. Sending credentials...");
         updateWindow();
+
+        Writer w;
+        w.writeU8(uint8_t(MsgType::Hello));
+        w.writeString(m_client->username);
+        w.writeString(m_client->password);
+        m_client->ws->sendBinary(toString(w.data));
       });
       return;
     }
@@ -777,6 +854,15 @@ bool OnlineSessionManager::join(Context* ctx, const std::string& address, int po
 
     const auto type = MsgType(type8);
     switch (type) {
+      case MsgType::Error: {
+        std::string text;
+        if (r.readString(text)) {
+          ui::execute_from_ui_thread([text] {
+            ui::Alert::show(fmt::format("Connection Error<<{}", text));
+          });
+        }
+        break;
+      }
       case MsgType::Welcome: {
         uint32_t peerId = 0;
         uint32_t perms = 0;
@@ -1441,7 +1527,13 @@ void OnlineSessionManager::onWelcome(uint32_t peerId, Permissions perms)
   m_localPeerId = peerId;
   m_localPerms = perms;
   m_peers[1] = Peer{ 1, kPermEditCanvas | kPermEditLayers | kPermLockLayers | kPermEditTimeline, "Host" };
-  m_peers[peerId] = Peer{ peerId, perms, fmt::format("You ({})", peerId) };
+  std::string name = "You";
+  if (m_client && !m_client->username.empty())
+    name = fmt::format("{} ({})", m_client->username, peerId);
+  else
+    name = fmt::format("You ({})", peerId);
+
+  m_peers[peerId] = Peer{ peerId, perms, name };
   appendChatLine(fmt::format("Connected. Permissions: {}", perms));
   updateWindow();
 }

@@ -64,8 +64,8 @@ public:
   bool localCanLockLayers() const;
   bool localCanEditTimeline() const;
 
-  bool startHost(Context* ctx, Doc* doc, int port, const std::string& bindAddress = "127.0.0.1");
-  bool join(Context* ctx, const std::string& address, int port);
+  bool startHost(Context* ctx, Doc* doc, int port, const std::string& username, const std::string& password, const std::string& bindAddress = "127.0.0.1");
+  bool join(Context* ctx, const std::string& address, int port, const std::string& username, const std::string& password);
   void leave();
 
   void attachWindow(OnlineSessionWindow* window);

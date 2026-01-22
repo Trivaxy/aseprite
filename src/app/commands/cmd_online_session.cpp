@@ -87,6 +87,20 @@ protected:
     port->setExpansive(true);
     portRow->addChild(port);
 
+    auto* userRow = new ui::HBox;
+    root->addChild(userRow);
+    userRow->addChild(new ui::Label("Username:"));
+    auto* user = new ui::Entry(256, "Host");
+    user->setExpansive(true);
+    userRow->addChild(user);
+
+    auto* passRow = new ui::HBox;
+    root->addChild(passRow);
+    passRow->addChild(new ui::Label("Password:"));
+    auto* pass = new ui::Entry(256, "");
+    pass->setExpansive(true);
+    passRow->addChild(pass);
+
     auto* buttons = new ui::HBox;
     root->addChild(buttons);
     auto* ok = new ui::Button("OK");
@@ -103,7 +117,7 @@ protected:
 
     const int p = parse_port(port->text(), 5000);
     auto* doc = context->activeDocument();
-    app::online::OnlineSessionManager::instance()->startHost(context, doc, p, addr->text());
+    app::online::OnlineSessionManager::instance()->startHost(context, doc, p, user->text(), pass->text(), addr->text());
     open_session_window();
   }
 };
@@ -135,6 +149,20 @@ protected:
     port->setExpansive(true);
     portRow->addChild(port);
 
+    auto* userRow = new ui::HBox;
+    root->addChild(userRow);
+    userRow->addChild(new ui::Label("Username:"));
+    auto* user = new ui::Entry(256, "Guest");
+    user->setExpansive(true);
+    userRow->addChild(user);
+
+    auto* passRow = new ui::HBox;
+    root->addChild(passRow);
+    passRow->addChild(new ui::Label("Password:"));
+    auto* pass = new ui::Entry(256, "");
+    pass->setExpansive(true);
+    passRow->addChild(pass);
+
     auto* buttons = new ui::HBox;
     root->addChild(buttons);
     auto* ok = new ui::Button("OK");
@@ -150,7 +178,7 @@ protected:
       return;
 
     const int p = parse_port(port->text(), 5000);
-    app::online::OnlineSessionManager::instance()->join(context, addr->text(), p);
+    app::online::OnlineSessionManager::instance()->join(context, addr->text(), p, user->text(), pass->text());
     open_session_window();
   }
 };

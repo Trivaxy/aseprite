@@ -1392,50 +1392,34 @@ void OnlineSessionManager::leave()
 // Paint stroke syncing
 //------------------------------------------------------------------------------
 
-void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
-                                                  const gfx::Region& dirtyArea)
+void OnlineSessionManager::sendSetPixelsRectNoLock(doc::Layer* layer,
+                                                   doc::frame_t frame,
+                                                   const gfx::Rect& spriteRcIn)
 {
-  if (!toolLoop || !toolLoop->getInk() || !toolLoop->getInk()->isPaint())
-    return;
-
-  if (dirtyArea.isEmpty())
-    return;
-
-  std::lock_guard lock(m_mutex);
-  if (m_role == Role::None || !m_doc || m_doc != toolLoop->getDocument())
-    return;
-
-  if (m_role == Role::Guest && (m_localPerms & kPermEditCanvas) == 0)
-    return;
-
-  auto* layer = toolLoop->getLayer();
   if (!layer)
+    return;
+
+  auto* spr = layer->sprite();
+  if (!spr)
+    return;
+
+  gfx::Rect spriteRc = spriteRcIn;
+  spriteRc &= spr->bounds();
+  if (spriteRc.isEmpty())
     return;
 
   std::vector<uint32_t> layerPath;
   if (!buildLayerPath(layer, layerPath))
     return;
 
-  gfx::Rect spriteRc = dirtyArea.bounds();
-  static constexpr int kStrokeMargin = 4;
-  spriteRc = spriteRc.enlarge(kStrokeMargin);
-  auto* spr = toolLoop->sprite();
-  if (spr)
-    spriteRc &= spr->bounds();
-
-  if (spriteRc.isEmpty())
-    return;
-
-  const doc::frame_t frame = toolLoop->getFrame();
   doc::Cel* cel = layer->cel(frame);
   doc::Image* img = (cel ? cel->image() : nullptr);
 
-  const int bpp = (img ? img->bytesPerPixel() : (spr ? spr->spec().bytesPerPixel() : 0));
+  const int bpp = (img ? img->bytesPerPixel() : spr->spec().bytesPerPixel());
   if (bpp <= 0)
     return;
-  const doc::color_t maskColor =
-    (img ? img->maskColor() : (spr ? spr->transparentColor() : doc::color_t(0)));
-  const size_t strideBytes = size_t(spriteRc.w) * size_t(bpp);
+
+  const doc::color_t maskColor = (img ? img->maskColor() : spr->transparentColor());
   std::vector<uint8_t> bytes(size_t(spriteRc.w) * size_t(spriteRc.h) * size_t(bpp));
 
   if (maskColor == 0) {
@@ -1497,6 +1481,51 @@ void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
     w.data.insert(w.data.end(), payload.data.begin(), payload.data.end());
     sendToHost(w.data);
   }
+}
+
+void OnlineSessionManager::onPaintStrokeCommitted(tools::ToolLoop* toolLoop,
+                                                  const gfx::Region& dirtyArea)
+{
+  if (!toolLoop || !toolLoop->getInk() || !toolLoop->getInk()->isPaint())
+    return;
+
+  if (dirtyArea.isEmpty())
+    return;
+
+  std::lock_guard lock(m_mutex);
+  if (m_role == Role::None || !m_doc || m_doc != toolLoop->getDocument())
+    return;
+
+  if (m_role == Role::Guest && (m_localPerms & kPermEditCanvas) == 0)
+    return;
+
+  auto* layer = toolLoop->getLayer();
+  if (!layer)
+    return;
+
+  gfx::Rect spriteRc = dirtyArea.bounds();
+  static constexpr int kStrokeMargin = 4;
+  spriteRc = spriteRc.enlarge(kStrokeMargin);
+  const doc::frame_t frame = toolLoop->getFrame();
+  sendSetPixelsRectNoLock(layer, frame, spriteRc);
+}
+
+void OnlineSessionManager::onPixelsRectCommitted(Doc* doc,
+                                                 doc::Layer* layer,
+                                                 doc::frame_t frame,
+                                                 const gfx::Rect& dirtyRect)
+{
+  if (!doc || !layer || dirtyRect.isEmpty())
+    return;
+
+  std::lock_guard lock(m_mutex);
+  if (m_role == Role::None || !m_doc || m_doc != doc)
+    return;
+
+  if (m_role == Role::Guest && (m_localPerms & kPermEditCanvas) == 0)
+    return;
+
+  sendSetPixelsRectNoLock(layer, frame, dirtyRect);
 }
 
 //------------------------------------------------------------------------------

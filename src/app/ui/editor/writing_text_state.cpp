@@ -16,6 +16,7 @@
 #include "app/extra_cel.h"
 #include "app/fonts/font_info.h"
 #include "app/i18n/strings.h"
+#include "app/online/online_session_manager.h"
 #include "app/pref/preferences.h"
 #include "app/site.h"
 #include "app/tx.h"
@@ -527,6 +528,14 @@ EditorState::LeaveAction WritingTextState::onLeaveState(Editor* editor, EditorSt
 
       expand.commit();
       tx.commit();
+
+      if (auto* session = online::OnlineSessionManager::instance();
+          session->isActive() && session->document() == site.document()) {
+        session->onPixelsRectCommitted(site.document(),
+                                       site.layer(),
+                                       site.frame(),
+                                       extraCel->cel()->bounds());
+      }
     }
     m_editor->releaseMouse();
     m_editor->document()->notifyGeneralUpdate();

@@ -21,6 +21,7 @@
 #include "app/doc_api.h"
 #include "app/i18n/strings.h"
 #include "app/modules/gui.h"
+#include "app/online/online_session_manager.h"
 #include "app/pref/preferences.h"
 #include "app/site.h"
 #include "app/snap_to_grid.h"
@@ -1036,6 +1037,15 @@ void PixelsMovement::dropImage()
 {
   m_isDragging = false;
 
+  doc::Layer* changedLayer = m_site.layer();
+  const doc::frame_t changedFrame = m_site.frame();
+  gfx::Rect dirtyRc = m_initialMask0 ? m_initialMask0->bounds() : gfx::Rect();
+  const gfx::Rect transformedRc = m_currentData.transformedBounds();
+  if (dirtyRc.isEmpty())
+    dirtyRc = transformedRc;
+  else if (!transformedRc.isEmpty())
+    dirtyRc = dirtyRc.createUnion(transformedRc);
+
   // Stamp the image in the current layer.
   stampImage(true);
 
@@ -1045,6 +1055,14 @@ void PixelsMovement::dropImage()
 
   // This is the end of the whole undo transaction.
   m_tx.commit();
+
+  if (changedLayer && !dirtyRc.isEmpty()) {
+    dirtyRc = dirtyRc.enlarge(2);
+    if (auto* session = online::OnlineSessionManager::instance();
+        session->isActive() && session->document() == m_document) {
+      session->onPixelsRectCommitted(m_document, changedLayer, changedFrame, dirtyRc);
+    }
+  }
 
   // Destroy the extra cel (this cel will be used by the drawing
   // cursor surely).

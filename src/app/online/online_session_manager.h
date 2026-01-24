@@ -88,6 +88,10 @@ public:
   std::string chatLog() const;
 
   void onPaintStrokeCommitted(tools::ToolLoop* toolLoop, const gfx::Region& dirtyArea);
+  void onPixelsRectCommitted(Doc* doc,
+                             doc::Layer* layer,
+                             doc::frame_t frame,
+                             const gfx::Rect& dirtyRect);
 
   bool requestNewFrame(Context* ctx, const std::string& content, doc::frame_t insertAt);
   bool requestRemoveFrame(Context* ctx, doc::frame_t frame);
@@ -167,6 +171,8 @@ private:
   void applyLayerLock(const std::vector<uint32_t>& layerPath, bool locked);
 
   std::vector<uint8_t> buildSnapshotBytes(Doc* doc);
+
+  void sendSetPixelsRectNoLock(doc::Layer* layer, doc::frame_t frame, const gfx::Rect& spriteRc);
 
   // Transport layer helpers
   void setupTransportCallbacks();

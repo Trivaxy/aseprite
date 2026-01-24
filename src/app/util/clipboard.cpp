@@ -24,6 +24,7 @@
 #include "app/i18n/strings.h"
 #include "app/modules/gfx.h"
 #include "app/modules/gui.h"
+#include "app/online/online_session_manager.h"
 #include "app/pref/preferences.h"
 #include "app/tx.h"
 #include "app/ui/color_bar.h"
@@ -44,6 +45,7 @@
 #include "render/quantization.h"
 #include "view/cels.h"
 
+#include <algorithm>
 #include <memory>
 #include <stdexcept>
 
@@ -361,14 +363,34 @@ void Clipboard::cut(ContextWriter& writer)
     console.printf("Can't copying an image portion from the current layer\n");
   }
   else {
+    gfx::Rect dirtyRc;
+    if (writer.document()->mask())
+      dirtyRc = writer.document()->mask()->bounds();
+
     // TODO This code is similar to DocView::onClear()
+    std::vector<std::pair<Layer*, frame_t>> targets;
     {
       Tx tx(writer, "Cut");
       Site site = writer.context()->activeSite();
       CelList cels = site.selectedUniqueCelsToEditPixels();
+      for (Cel* cel : cels) {
+        if (!cel || !cel->layer())
+          continue;
+        const auto target = std::make_pair(cel->layer(), cel->frame());
+        if (std::find(targets.begin(), targets.end(), target) == targets.end())
+          targets.push_back(target);
+      }
       clearMaskFromCels(tx, writer.document(), site, cels,
                         true); // Deselect mask
       tx.commit();
+    }
+
+    if (!dirtyRc.isEmpty()) {
+      if (auto* session = online::OnlineSessionManager::instance();
+          session->isActive() && session->document() == writer.document()) {
+        for (const auto& [layer, frame] : targets)
+          session->onPixelsRectCommitted(writer.document(), layer, frame, dirtyRc);
+      }
     }
     writer.document()->generateMaskBoundaries();
     update_screen_for_document(writer.document());

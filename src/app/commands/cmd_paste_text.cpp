@@ -19,6 +19,7 @@
 #include "app/console.h"
 #include "app/context.h"
 #include "app/context_access.h"
+#include "app/online/online_session_manager.h"
 #include "app/pref/preferences.h"
 #include "app/site.h"
 #include "app/tx.h"
@@ -179,6 +180,14 @@ void PasteTextCommand::onExecute(Context* ctx)
                            gfx::Region(finalImage->bounds()),
                            point));
     tx.commit();
+
+    if (auto* session = online::OnlineSessionManager::instance();
+        session->isActive() && session->document() == writer.document()) {
+      session->onPixelsRectCommitted(writer.document(),
+                                     writer.layer(),
+                                     writer.frame(),
+                                     gfx::Rect(point, finalImage->size()));
+    }
   }
   catch (const std::exception& ex) {
     Console::showException(ex);
